@@ -780,6 +780,24 @@ def read_file_pinned(
     max_bytes: int = 64 * 1024,
     refusal: type[Exception] = OSError,
 ) -> str:
+    """:func:`read_bytes_pinned`, decoded as UTF-8 with replacement.
+
+    The text form for notes and briefings; a caller that must see the file's
+    exact bytes (a content digest) reads them through :func:`read_bytes_pinned`
+    instead, since replacement is lossy.
+    """
+    return read_bytes_pinned(target, what=what, max_bytes=max_bytes, refusal=refusal).decode(
+        "utf-8", errors="replace"
+    )
+
+
+def read_bytes_pinned(
+    target: Path | str,
+    *,
+    what: str,
+    max_bytes: int = 64 * 1024,
+    refusal: type[Exception] = OSError,
+) -> bytes:
     """Read *target* without ever following a planted link. The READ counterpart
     to :func:`write_file_pinned`, with the identical chokepoint discipline.
 
@@ -798,6 +816,13 @@ def read_file_pinned(
     * The target is ``lstat``-ed THROUGH that descriptor and refused when it is a
       symlink or not a regular file. That check is portable, so it holds where
       ``O_NOFOLLOW`` does not.
+    * The target is refused when it has more than one link (``st_nlink != 1``),
+      checked on the OPENED descriptor: a hard link is the one planted name a
+      symlink check cannot see -- ``ln <credential> <briefing>`` puts the
+      credential's very inode at the briefing's name, regular file and all --
+      and a read through it would copy the credential into whatever the label
+      publishes (a member's briefing, a note). The same rule the pinned copy
+      applies to its sources.
 
     Windows degrades exactly as the write does: the ``lstat`` refusal of a
     non-regular target is KEPT (the leg that stops a PLANTED name from being
@@ -826,7 +851,9 @@ def read_file_pinned(
         if not _stat.S_ISREG(st.st_mode):
             raise refusal(f"refusing to read {what}: {target} is not a regular file")
         with open(target, "rb") as handle:
-            return handle.read(max_bytes).decode("utf-8", errors="replace")
+            if os.fstat(handle.fileno()).st_nlink != 1:
+                raise refusal(f"refusing to read {what}: {target} has more than one link")
+            return handle.read(max_bytes)
     dir_fd = pin_parent(parent, what=what, refusal=refusal)
     try:
         st = stat_at(dir_fd, name)
@@ -836,7 +863,22 @@ def read_file_pinned(
             raise refusal(f"refusing to read {what}: {target} is not a regular file")
         fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
         try:
-            return os.read(fd, max_bytes).decode("utf-8", errors="replace")
+            # On the descriptor, not the pre-open stat: the link count is what
+            # the inode says NOW, and a hard link swapped in between the stat
+            # and the open would otherwise be read.
+            if os.fstat(fd).st_nlink != 1:
+                raise refusal(f"refusing to read {what}: {target} has more than one link")
+            # Read to the bound or EOF: one ``os.read`` may return short, and a
+            # digest over a short read would refuse an intact file.
+            chunks: list[bytes] = []
+            remaining = max_bytes
+            while remaining > 0:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
         finally:
             os.close(fd)
     finally:

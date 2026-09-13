@@ -2062,6 +2062,7 @@ def update_config_locked(
     stamp_meta: bool = True,
     on_corrupt: Literal["fail", "reset"] = "fail",
     wait_for_lock: bool = True,
+    after_write: Callable[[dict], None] | None = None,
 ) -> dict:
     """Perform an atomic read-modify-write of a config file under an advisory lock.
 
@@ -2157,6 +2158,15 @@ def update_config_locked(
         the event-loop thread, where a POSIX ``flock`` wait would stall the
         gateway for as long as the holder keeps it.  It never relaxes the
         serialization -- a contended acquire declines instead of proceeding.
+    after_write : ((dict) -> None) | None
+        Called with the written document INSIDE the same lock hold, after the
+        rename landed and the cache was invalidated; not called when *mutate*
+        returned ``None``.  For side state that must be published only once
+        the config commit is durable AND before any other writer can take the
+        lock -- a record beside the config that a row's provenance points at,
+        which would otherwise advance (or vanish) on a rename that then failed,
+        or be raced by a same-key re-creation that takes this lock.  An
+        exception propagates to the caller with the config already written.
 
     Returns
     -------
@@ -2201,6 +2211,8 @@ def update_config_locked(
         # than on its next poll.
         _invalidate_config_cache()
         _notify_live_watch()
+        if after_write is not None:
+            after_write(result)
         return result
 
 
@@ -3865,6 +3877,10 @@ class KiroCrewConfig:
                         # parsed value back -- a collapsed copy would stop
                         # matching the overlay's key and re-create the phantom.
                         legacy_key=_verbatim_text(entry.get("legacy_key", "")),
+                        template=_member_identity.collapse_display_name(entry.get("template", "")),
+                        template_version=_member_identity.collapse_display_name(
+                            entry.get("template_version", "")
+                        ),
                         # Hand-editable config: a quoted "true" or a stray int
                         # must not become a truthy star, so only a real bool
                         # is honoured and anything else reads as un-starred.

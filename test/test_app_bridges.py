@@ -3676,6 +3676,7 @@ class TestBuiltinDeclaredResourcesActuallyRegister:
                         }
                     ]
                 },
+                "crew": {"templates": [{"agent": "agents/a.json", "role": "Probe role"}]},
             }
         )
         # Every declared field must be populated above, otherwise a conditional
@@ -4837,3 +4838,131 @@ class TestScrubDoesNotRematerializeAgents:
 
         assert brmod.scrub_backend_mcp_url("app") == []
         assert removed == ["app"]
+
+
+# ---------------------------------------------------------------------------
+# Shared-template fingerprint (design step 3: shared template files are the
+# publisher's, read-only to members; KAS refuses one that changed under the record)
+# ---------------------------------------------------------------------------
+
+
+class TestSharedTemplateFingerprint:
+    def _materialize(self, tmp_path, app_env):
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        app_root = app_env["home"] / "apps" / "test-app"
+        _register_agents("test-app", manifest, app_root)
+        return app_env["kiro_agents"] / "test-app--my-agent.json", manifest, app_root
+
+    def test_materialization_records_the_fingerprint_of_the_bytes_written(self, tmp_path, app_env):
+        from kiro_crew import agent_state
+        from kiro_crew.apps.bridges import shared_template_digest
+
+        link, _manifest, _root = self._materialize(tmp_path, app_env)
+        recorded = agent_state.get_shared_template_digest("test-app--my-agent")
+        assert recorded == shared_template_digest(link.read_bytes())
+        assert recorded is not None and recorded.startswith("sha256:")
+        # Written as bytes: no platform line-ending translation, so the bytes
+        # the KAS projection hashes are the bytes the record was taken over.
+        assert b"\r" not in link.read_bytes()
+
+    def test_re_materialization_refreshes_the_record(self, tmp_path, app_env):
+        from kiro_crew import agent_state
+        from kiro_crew.apps.bridges import shared_template_digest
+
+        link, manifest, app_root = self._materialize(tmp_path, app_env)
+        first = agent_state.get_shared_template_digest("test-app--my-agent")
+        # A template change lands on the next registration (the bridge's contract)
+        # and the record follows the bytes it wrote.
+        (app_root / "agents" / "my-agent.json").write_text(
+            json.dumps({"name": "my-agent", "model": "auto", "description": "v2"})
+        )
+        _register_agents("test-app", manifest, app_root)
+        second = agent_state.get_shared_template_digest("test-app--my-agent")
+        assert second != first
+        assert second == shared_template_digest(link.read_bytes())
+
+    def test_a_trusted_rewrite_through_the_agent_writer_re_records(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """Every gateway-side rewrite of an agent file (the editor's PATCH, a model
+        reset, the spec migration) funnels through ``agent._atomic_json_write``; a
+        fingerprinted file rewritten there must keep matching its record, or the
+        gateway's own edit would lock the template out of KAS."""
+        from kiro_crew import agent, agent_state
+        from kiro_crew.apps.bridges import shared_template_digest
+
+        link, _manifest, _root = self._materialize(tmp_path, app_env)
+        monkeypatch.setattr(agent, "KIRO_AGENTS_DIR", app_env["kiro_agents"])
+        spec = json.loads(link.read_text(encoding="utf-8"))
+        spec["description"] = "tuned by the owner"
+        agent._atomic_json_write(link, spec)
+        assert agent_state.get_shared_template_digest("test-app--my-agent") == (
+            shared_template_digest(link.read_bytes())
+        )
+        assert b"\r" not in link.read_bytes()  # newline="": no translation anywhere
+        # A file nobody fingerprinted is left alone: no record appears for it.
+        other = app_env["kiro_agents"] / "hand-written.json"
+        agent._atomic_json_write(other, {"name": "hand-written", "prompt": "x"})
+        assert agent_state.get_shared_template_digest("hand-written") is None
+        # Nor for a same-named JSON outside the agents dir.
+        elsewhere = tmp_path / "test-app--my-agent.json"
+        agent._atomic_json_write(elsewhere, {"name": "decoy"})
+        assert agent_state.get_shared_template_digest("test-app--my-agent") == (
+            shared_template_digest(link.read_bytes())
+        )
+
+    def test_a_rewrite_whose_record_cannot_follow_is_rolled_back(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """File and record are one transaction. When the sidecar write fails
+        after the new bytes landed, the previous bytes are put back, so what
+        is on disk still matches the digest the record holds and KAS keeps
+        spawning the template; the caller sees the failure (its edit did not
+        happen). An unreadable sidecar refuses the write before a byte lands."""
+        from kiro_crew import agent, agent_state
+        from kiro_crew.apps.bridges import shared_template_digest
+
+        link, _manifest, _root = self._materialize(tmp_path, app_env)
+        monkeypatch.setattr(agent, "KIRO_AGENTS_DIR", app_env["kiro_agents"])
+        before = link.read_bytes()
+        recorded = agent_state.get_shared_template_digest("test-app--my-agent")
+        spec = json.loads(before.decode("utf-8"))
+        spec["description"] = "tuned by the owner"
+
+        def refuse(name, digest):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(agent_state, "set_shared_template_digest", refuse)
+        with pytest.raises(OSError):
+            agent._atomic_json_write(link, spec)
+        assert link.read_bytes() == before
+        assert agent_state.get_shared_template_digest("test-app--my-agent") == recorded
+        assert recorded == shared_template_digest(link.read_bytes())
+        monkeypatch.undo()
+        monkeypatch.setattr(agent, "KIRO_AGENTS_DIR", app_env["kiro_agents"])
+        # The record unreadable: refused before the file changes.
+        state = agent_state._state_path()
+        good = state.read_text(encoding="utf-8")
+        state.write_text("{not json", encoding="utf-8")
+        with pytest.raises(ValueError):
+            agent._atomic_json_write(link, spec)
+        assert link.read_bytes() == before
+        state.write_text(good, encoding="utf-8")
+        # And the ordinary rewrite still lands with its record following.
+        agent._atomic_json_write(link, spec)
+        assert json.loads(link.read_text(encoding="utf-8"))["description"] == "tuned by the owner"
+        assert agent_state.get_shared_template_digest("test-app--my-agent") == (
+            shared_template_digest(link.read_bytes())
+        )
+
+    def test_deregistration_forgets_the_record(self, tmp_path, app_env):
+        from kiro_crew import agent_state
+
+        self._materialize(tmp_path, app_env)
+        assert agent_state.get_shared_template_digest("test-app--my-agent") is not None
+        assert _deregister_agents("test-app") == 1
+        assert agent_state.get_shared_template_digest("test-app--my-agent") is None

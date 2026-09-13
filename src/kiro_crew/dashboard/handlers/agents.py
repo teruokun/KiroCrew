@@ -2580,6 +2580,7 @@ def _write_private_copy(
     bound: set[str],
     operation: str,
     doc: dict,
+    source_spec: dict | None = None,
 ) -> tuple[str, Path]:
     """Create crew *crew*'s private copy of template *source_name*; return its name and path.
 
@@ -2614,9 +2615,17 @@ def _write_private_copy(
     """
     if source_path is None:
         raise FileNotFoundError(source_name)
-    fresh_source = _read_agent_spec(source_path, operation=operation, source="dashboard")
-    if fresh_source is None:
-        raise FileNotFoundError(source_path)
+    if source_spec is not None:
+        # The caller's VERIFIED snapshot of the source (a store hire checked
+        # these bytes against the card's digests and the bridge's rendering):
+        # copied as given, so a source swapped between that check and this
+        # write is not what lands in the member's file.
+        fresh_source: dict = dict(source_spec)
+    else:
+        read_source = _read_agent_spec(source_path, operation=operation, source="dashboard")
+        if read_source is None:
+            raise FileNotFoundError(source_path)
+        fresh_source = read_source
     base = re.sub(r"[^A-Za-z0-9_.-]+", "-", crew)[:48].strip("-.") or "agent"
     managed_stems = {Path(f).stem.lower() for f in OWNED_KIRO_AGENT_FILES}
     copy_name, suffix = base, 2
@@ -4614,6 +4623,7 @@ async def _create_crew(
     body: dict,
     *,
     copy_source: str | None = None,
+    copy_spec: dict | None = None,
     admit: Callable[[Collection[str], str], web.Response | None] | None = None,
 ) -> web.Response:
     """Validate *body* and create the crew row it describes.
@@ -4631,7 +4641,9 @@ async def _create_crew(
     shared template after the hire completed, which is the exact hazard the
     hire's copy exists to remove. A copy whose row then fails to persist is
     unwound (file and lineage). The answer carries ``kiro_agent`` -- the copy's
-    name -- beside the id.
+    name -- beside the id. *copy_spec*, when given with *copy_source*, is the
+    caller's verified snapshot of the source's content: the copy is made from
+    it rather than from a re-read of the source file.
 
     *admit*, when given, takes the member ids the document holds and the
     minted id and runs TWICE: inside the config-lock hold against the loaded
@@ -5000,6 +5012,7 @@ async def _create_crew(
                                 bound=bound,
                                 operation="member.hire",
                                 doc=cfg_data,
+                                source_spec=copy_spec,
                             )
                         )
                     return None
@@ -5706,7 +5719,12 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-async def _delete_crew_record(request: web.Request, name: str) -> None:
+async def _delete_crew_record(
+    request: web.Request,
+    name: str,
+    *,
+    expect: Callable[[dict], str | None] | None = None,
+) -> None:
     """Remove crew *name*: its ``agents`` row, its private memory (archived, not
     erased), its cached store handles and its uploaded picture.
 
@@ -5714,7 +5732,14 @@ async def _delete_crew_record(request: web.Request, name: str) -> None:
     CALLER holds the config lock and has already decided the crew may go (it
     exists, it is not the default). The row is removed inside a locked
     read-modify-write that re-checks both, so a concurrent promotion or removal
-    raises ``UnknownMemoryStore`` instead of deleting the wrong thing. A V2
+    raises ``UnknownMemoryStore`` instead of deleting the wrong thing. *expect*,
+    when given, is the caller's OWN identity check on the row as the document
+    holds it inside that cross-process lock: it returns a reason when the row
+    is not the one the caller decided to remove (a roll-back's "still bound to
+    the source I created it against, still carrying the store I minted"), and
+    the mutation then raises ``UnknownMemoryStore`` with it -- so a writer in
+    another process that replaced the row between the caller's read and this
+    write cannot have its member deleted in the original's name. A V2
     private store owned by the crew is archived under the ordinary retirement
     marker -- never unlinked -- in the same hold, and the archive is rolled back
     if the config write then fails, so config and store never disagree.
@@ -5737,6 +5762,10 @@ async def _delete_crew_record(request: web.Request, name: str) -> None:
             ):
                 raise UnknownMemoryStore(f"Crew Member {name!r} became the default")
             entry = agents[name]
+            if expect is not None:
+                why = expect(entry if isinstance(entry, dict) else {})
+                if why:
+                    raise UnknownMemoryStore(why)
             stores = coerce_dict_section(doc, "memory_stores")
             store_name = entry.get("memory_store", "") if isinstance(entry, dict) else ""
             record = stores.get(store_name)
