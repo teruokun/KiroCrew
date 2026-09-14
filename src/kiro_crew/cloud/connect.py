@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from kiro_crew.cloud import ssm
+from kiro_crew.platform.interfaces import BUILTIN_PROVISIONER_ID
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +185,9 @@ def connect(
             # false positive (`exc` is an AWSError/permission message, never the
             # JWT — the token is never logged; see redact_token()), but the
             # neutral wording keeps the SAST gate green without a nosemgrep.
-            logger.warning("dashboard sign-in provisioning failed on local port %d: %s", local_port, exc)
+            logger.warning(
+                "dashboard sign-in provisioning failed on local port %d: %s", local_port, exc
+            )
             error = (
                 "connected the SSM tunnel but minting a dashboard token failed "
                 f"({exc}) — check `kirocrew cloud status` / your IAM permissions, "
@@ -250,6 +253,7 @@ def register_instance(
     profile: str = "",
     region: str = "",
     remote_port: int = DEFAULT_REMOTE_DASHBOARD_PORT,
+    provisioner_id: str = BUILTIN_PROVISIONER_ID,
 ) -> Optional[str]:
     """Register the box in the Instances registry for the /instances dashboard.
 
@@ -286,6 +290,7 @@ def register_instance(
                     aws_profile=profile,
                     aws_region=region,
                     remote_port=remote_port,
+                    provisioner_id=provisioner_id,
                 )
                 return existing.id
         inst = reg.add(
@@ -295,6 +300,7 @@ def register_instance(
             aws_profile=profile,
             aws_region=region,
             remote_port=remote_port,
+            provisioner_id=provisioner_id,
         )
         return inst.id
     except Exception as exc:  # pragma: no cover - non-fatal

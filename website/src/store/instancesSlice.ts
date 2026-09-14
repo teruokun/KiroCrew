@@ -118,7 +118,11 @@ interface CrewFormState {
    * would count someone else's concurrent change as the user's own edit and
    * write back a field the user never touched.
    */
-  edit: { id: string; draft: InstanceDraft; seq: number } | null
+  edit: {
+    id: string
+    draft: InstanceDraft
+    seq: number
+  } | null
 }
 
 interface InstancesState {

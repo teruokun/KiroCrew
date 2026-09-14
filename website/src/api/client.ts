@@ -1751,6 +1751,8 @@ export interface InstanceView {
   /** SSM-only: AWS region ('' = profile/environment default). */
   aws_region: string
   ssm_run_as: string
+  /** Provisioner that created this crew, when it came from a launcher. */
+  provisioner_id?: string
   was_connected: boolean
   status: InstanceTunnelStatus
 }

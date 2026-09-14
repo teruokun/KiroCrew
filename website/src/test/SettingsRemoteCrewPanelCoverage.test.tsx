@@ -84,6 +84,7 @@ const CLOUD_INSTANCE: InstanceView = {
   aws_profile: 'Admin',
   aws_region: 'us-west-2',
   ssm_run_as: '',
+  provisioner_id: 'aws_ec2',
   remote_port: 5476,
   local_port: 0,
   ttl: '20h',
@@ -421,7 +422,7 @@ describe('RemoteCrewPanel — instance actions', () => {
     renderWithProviders(<RemoteCrewPanel />)
 
     // An absent cap falls back to the default rather than advertising "up to 0".
-    expect(await screen.findByText(/Up to 5 stay warm at once/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Up to 10 stay warm at once/i)).toBeInTheDocument()
 
     await openRowMenu(u)
     await u.click(await screen.findByRole('menuitem', { name: /^Delete Kiro Crew Cloud/ }))
@@ -1011,6 +1012,29 @@ describe('RemoteCrewPanel — editing a crew', () => {
     const refusal = screen.getByRole('alert')
     expect(refusal).toHaveTextContent(/Save or cancel the open edit/i)
     expect(refusal.closest('[data-crew-id]')?.getAttribute('data-crew-id')).toBe('m2')
+  })
+
+  it('reuses the same-row edit form when Rename is chosen', async () => {
+    const u = setup()
+    renderWithProviders(<RemoteCrewPanel />)
+
+    await openRowMenu(u, /More actions for dev-box-1/i)
+    await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+    const settings = within(
+      await screen.findByRole('group', { name: /Edit dev-box-1/i }),
+    )
+    const host = settings.getByRole('textbox', { name: /SSH host/i })
+    await u.clear(host)
+    await u.type(host, 'dev-box-1-corrected')
+
+    await openRowMenu(u, /More actions for dev-box-1/i)
+    await u.click(await screen.findByRole('menuitem', { name: /^Rename$/i }))
+
+    expect(screen.getByRole('group', { name: /Edit dev-box-1/i })).toBeInTheDocument()
+    expect(screen.queryByText(/Save or cancel the open edit/i)).not.toBeInTheDocument()
+    expect(host).toHaveValue('dev-box-1-corrected')
+    expect(screen.getAllByRole('group', { name: /Edit dev-box-1/i })).toHaveLength(1)
+    expect(api.updateInstance).not.toHaveBeenCalled()
   })
 
   it('keeps a typed edit across a switch to the setup tab and back', async () => {

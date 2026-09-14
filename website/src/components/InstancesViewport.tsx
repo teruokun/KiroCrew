@@ -150,7 +150,7 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
     refetchInterval: 60_000,
     enabled: !embedded,
   })
-  const warmCap = instancesQuery.data?.warm_set_cap || 5
+  const warmCap = instancesQuery.data?.warm_set_cap || 10
 
   // Current warm map in a ref so the refresh callback (used by the long-lived
   // postMessage listener) always sees the latest ports without re-subscribing.

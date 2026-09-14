@@ -145,7 +145,7 @@ export function useAutoConnectInstances() {
     const data = instancesQuery.data
     if (!data?.active || !data.instances?.length) return
 
-    const warmCap = data.warm_set_cap || 5
+    const warmCap = data.warm_set_cap || 10
     const excluded = readAutoConnectExcludes()
     const now = Date.now()
     const targets = selectAutoConnectTargets(data.instances, warmRef.current, excluded, warmCap)

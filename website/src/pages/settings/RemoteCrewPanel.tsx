@@ -36,6 +36,7 @@ import {
   Loader2,
   MoreHorizontal,
   Pencil,
+  Settings2,
   Play,
 } from 'lucide-react'
 import {
@@ -85,6 +86,11 @@ import {
 /** A launch job the user is still waiting on (not yet a switchable crew). */
 const IN_PROGRESS: LaunchJob['status'][] = ['pending', 'running', 'awaiting_signin']
 const isInProgress = (j: LaunchJob) => IN_PROGRESS.includes(j.status)
+
+const connectionTypeLabel = (inst: InstanceView): string =>
+  inst.connection_method === 'ssm'
+    ? i18nT('pages.settings.remoteCrewPanel.type_ssm')
+    : i18nT('pages.settings.remoteCrewPanel.type_ssh')
 
 /** Remembered across navigation — see the state declarations for why. */
 const CLOUD_PROFILE_KEY = 'mc-cloud-profile'
@@ -346,7 +352,14 @@ function CrewRow({
         <div className="min-w-0">
           <div className="text-text-strong text-sm font-medium truncate">{inst.name}</div>
           <div className="text-[12px] text-muted truncate">
-            <span className="uppercase tracking-wide text-muted-strong">{inst.connection_method === 'ssm' ? 'SSM' : 'SSH'}</span>{' '}
+            {inst.provisioner_id === 'aws_ec2' && (
+              <Badge variant="muted" className="mr-1">
+                {i18nT('pages.settings.remoteCrewPanel.source_ec2')}
+              </Badge>
+            )}
+            <Badge variant="muted" className="mr-1">
+              {connectionTypeLabel(inst)}
+            </Badge>
             {target}
             {inst.connection_method === 'ssm' && inst.aws_region ? ` (${inst.aws_region})` : ''} {i18nT('pages.settings.instancesPanel.port_2')} {inst.remote_port}
           </div>
@@ -441,13 +454,19 @@ function CrewRow({
           <DropdownMenuContent align="end" className="min-w-[200px]">
             <DropdownMenuItem
               className="gap-2 text-[13px]"
+              onSelect={() => onEdit(inst.id)}
+            >
+              <Pencil className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.rename')}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              className="gap-2 text-[13px]"
               onSelect={() => onDiagnose(inst.id)}
               aria-label={i18nT('pages.settings.instancesPanel.diagnose_2', { name: inst.name })}
             >
               <Stethoscope className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.diagnose')}
             </DropdownMenuItem>
             <DropdownMenuItem className="gap-2 text-[13px]" onSelect={() => onEdit(inst.id)}>
-              <Pencil className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.edit_settings')}
+              <Settings2 className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.edit_settings')}
             </DropdownMenuItem>
             {isCloud ? (
               <>
@@ -759,7 +778,6 @@ export function RemoteCrewPanel() {
   // `seq` counts REBASES, and is used as the form's React key: adopting the current
   // record rewrites the draft's values, and a mounted form cannot re-seed itself.
   const editDraft = useAppSelector(s => s.instances.crewForms?.edit ?? null)
-  const editDirty = editDraft !== null
   // Which row's Edit was refused, not a bare flag: the refusal has to render at
   // the row the user actually clicked. Shown once at the bottom of the Card it
   // could sit off-screen in a long crew list, so the click looked like a no-op.
@@ -939,7 +957,7 @@ export function RemoteCrewPanel() {
   })
 
   const instances = useMemo(() => instancesQuery.data?.instances ?? [], [instancesQuery.data])
-  const warmCap = instancesQuery.data?.warm_set_cap || 5
+  const warmCap = instancesQuery.data?.warm_set_cap || 10
 
   // A draft outlives its form ON PURPOSE, which means it can also outlive the CREW
   // it belongs to: Remove a crew mid-edit and the draft stays keyed by that id, so
@@ -1370,7 +1388,13 @@ export function RemoteCrewPanel() {
                     editing={editingId === inst.id}
                     blocked={editBlockedId === inst.id}
                     onEdit={id => {
-                      if (id !== null && editingId !== null && id !== editingId && editDirty) {
+                      // Rename and Edit settings open the same form. Switching rows
+                      // would still unmount a different crew's unsaved draft.
+                      if (
+                        id !== null
+                        && editDraft !== null
+                        && id !== editDraft.id
+                      ) {
                         setEditBlockedId(id)
                         return
                       }
@@ -1409,10 +1433,14 @@ export function RemoteCrewPanel() {
                       const next =
                         draft === null
                           ? null
-                          : { id: inst.id, draft, seq: editDraft?.id === inst.id ? editDraft.seq : 0 }
+                          : {
+                              id: inst.id, draft,
+                              seq: editDraft?.id === inst.id ? editDraft.seq : 0,
+                            }
                       // Same values, same action: the report fires on every keystroke,
                       // and dispatching an equal-but-new object re-renders for nothing.
                       if (JSON.stringify(editDraft) === JSON.stringify(next)) return
+                      if (next === null) setEditBlockedId(null)
                       dispatch(setCrewEditForm(next))
                     }}
                     // Clearing editingId without clearing the refusal left the UI

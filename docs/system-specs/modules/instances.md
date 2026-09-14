@@ -230,9 +230,9 @@ non-POSIX (§12). Treat a Windows hub as unverified.
    stay warm: iframe mounted (hide-not-unmount, so switching never reloads or
    re-runs the token handshake) with a live tunnel and WebSocket. The default
    (`0`) is **automatic**: `GET /api/instances` resolves the cap from how many
-   crews are REGISTERED (`resolve_warm_set_cap`, bounded by
-   `WARM_SET_CAP_AUTO_CEILING`), so up to that ceiling no crew the operator
-   configured is evicted; an explicit integer is served verbatim, including one
+   crews are REGISTERED (`resolve_warm_set_cap`, bounded by the current
+   `WARM_SET_CAP_AUTO_CEILING` of 10), so no crew the operator configured is
+   evicted within that range; an explicit integer is served verbatim, including one
    below the registered count. Registered rather than connected because a live
    count races tunnel startup: a crew whose tunnel came up a moment after the
    dashboard polled fell outside the cap and lost its pane, so exactly one crew
@@ -306,7 +306,7 @@ cannot drift.
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `instances.enabled` | `false` | Primary opt-in, read at gateway startup. Also gates the CSP `frame-src` `*.localhost` extension. |
-| `instances.warm_set_cap` | `0` (automatic) | Max instances kept warm at once (bounds memory/sockets; each warm instance is a full dashboard SPA). `0` tracks how many crews are registered, so up to an internal ceiling no configured crew is evicted; an explicit value is honoured exactly, including one below the registered count. Negative values fall back to automatic. |
+| `instances.warm_set_cap` | `0` (automatic) | Max instances kept warm at once (bounds memory/sockets; each warm instance is a full dashboard SPA). `0` tracks how many crews are registered, up to the automatic ceiling of 10, so no configured crew in that range is evicted; an explicit value is honoured exactly, including one below the registered count. Negative values fall back to automatic. |
 | `instances.tunnel_base_port` | `7778` | First local loopback port the allocator hands out. Out-of-range values fall back to the default. |
 | `instances.ssh_compression` | `true` | Add `-C` to the tunnel argv. See §5.2. |
 | `instances.connect_timeout_secs` | unset (SSH `15.0`, SSM `25.0`) | How long (secs) to wait for the local forward port to accept connections before declaring a connect attempt failed. Hosts behind a ProxyCommand or jump host need longer (the proxy handshake runs before ssh begins the forward). An explicit value applies to both transports, including a value equal to either transport's default. Values below 1 fall back to the transport defaults; values above 120 are clamped to 120. |
@@ -628,6 +628,22 @@ what its own edit invalidated, and never reopens anything on the user's behalf.
    row. **Edit settings** / **Remove** live in the row's overflow menu — a row
    shows two primary actions plus that menu, so everything past them is one
    menu deep.
+
+Every configured row carries a type badge from the data the gateway already
+owns. Native `connection_method="ssm"` records are **SSM**. An SSH record whose
+target matches an `aws_ec2` launch job is **EC2 / SSH**. Every other SSH record,
+including a hand-added host or an unknown provisioner, is **SSH** rather than
+being guessed into an EC2 category.
+
+**Rename** is a focused row action. It uses the same `PATCH /api/instances/{id}`
+and registry file as Edit settings, but sends only the trimmed `name`. A successful
+save invalidates the shared instances query, updating the list and pane labels;
+an API rejection stays beside the open draft instead of closing the form. The
+held draft also records whether it belongs to Rename or Edit settings, so an
+in-app route remount reopens the same focused form. A dirty draft owns both its
+row and mode until Save or Cancel: opening Rename while unsaved settings exist
+is refused, including on the same row, so a name-only success can never clear
+settings work it did not save.
 
 An unsaved edit is held by the PANEL, keyed by crew, not by the form component.
 The crew list unmounts for any number of reasons the form cannot see — switching

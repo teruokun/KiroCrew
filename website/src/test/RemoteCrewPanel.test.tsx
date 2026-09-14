@@ -69,6 +69,7 @@ const CLOUD_INSTANCE = {
   aws_profile: '',
   aws_region: 'us-east-1',
   ssm_run_as: '',
+  provisioner_id: 'aws_ec2',
   remote_port: 5476,
   local_port: 0,
   ttl: '20h',
@@ -220,6 +221,9 @@ describe('RemoteCrewPanel', () => {
     // Not labelled as hand-added, because we cannot know that.
     expect(await screen.findByText(/cannot verify whether this machine has AWS resources/i)).toBeInTheDocument()
     expect(screen.queryByText(/does not manage this machine/i)).not.toBeInTheDocument()
+    const row = screen.getByText(CLOUD_INSTANCE.name).closest('[data-crew-id]') as HTMLElement
+    expect(within(row).getByText('EC2')).toBeInTheDocument()
+    expect(within(row).getByText('SSM')).toBeInTheDocument()
 
     // The trash is confirm-gated, and the warning states what Remove does NOT do.
     await openRowMenu(u)
@@ -262,6 +266,126 @@ describe('RemoteCrewPanel', () => {
     expect(
       screen.getByText(/cannot verify whether this machine has AWS resources/i),
     ).toBeInTheDocument()
+  })
+
+  it('labels SSM, confirmed EC2 over SSH, and plain SSH crews accurately', async () => {
+    const ec2Ssh = {
+      ...MANUAL_INSTANCE,
+      id: 'legacy-ec2',
+      name: 'Legacy EC2',
+      ssh_host: 'i-0feed123456789abc',
+      provisioner_id: 'aws_ec2',
+    }
+    const ec2SshJob = {
+      ...DONE_JOB,
+      id: 'j-ssh',
+      tag: 'kc-ssh',
+      instance_id: ec2Ssh.ssh_host,
+    }
+    vi.mocked(api.listInstances).mockResolvedValue({
+      active: true,
+      warm_set_cap: 10,
+      instances: [CLOUD_INSTANCE, ec2Ssh, MANUAL_INSTANCE],
+    })
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [DONE_JOB, ec2SshJob] })
+    renderWithProviders(<RemoteCrewPanel />)
+
+    const cloudRow = (await screen.findByText(CLOUD_INSTANCE.name)).closest('[data-crew-id]')
+    const ec2SshRow = screen.getByText(ec2Ssh.name).closest('[data-crew-id]')
+    const sshRow = screen.getByText(MANUAL_INSTANCE.name).closest('[data-crew-id]')
+
+    expect(cloudRow).not.toBeNull()
+    expect(ec2SshRow).not.toBeNull()
+    expect(sshRow).not.toBeNull()
+    expect(within(cloudRow as HTMLElement).getByText('EC2')).toBeInTheDocument()
+    expect(within(cloudRow as HTMLElement).getByText('SSM')).toBeInTheDocument()
+    expect(within(ec2SshRow as HTMLElement).getByText('EC2')).toBeInTheDocument()
+    expect(within(ec2SshRow as HTMLElement).getByText('SSH')).toBeInTheDocument()
+    expect(within(sshRow as HTMLElement).getByText('SSH')).toBeInTheDocument()
+    expect(within(sshRow as HTMLElement).queryByText('EC2')).not.toBeInTheDocument()
+  })
+
+  it('renames a configured crew and refreshes its visible label', async () => {
+    let rows = [MANUAL_INSTANCE]
+    vi.mocked(api.listInstances).mockImplementation(async () => ({
+      active: true,
+      warm_set_cap: 10,
+      instances: rows,
+    }))
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    vi.mocked(api.updateInstance).mockImplementation(async (_id, body) => {
+      rows = [{ ...MANUAL_INSTANCE, name: String(body.name) }]
+      return rows[0]
+    })
+    const u = userEvent.setup()
+    renderWithProviders(<RemoteCrewPanel />)
+
+    await openRowMenu(u, /More actions for dev-box-1/i)
+    await u.click(await screen.findByRole('menuitem', { name: 'Rename' }))
+    const form = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    const name = form.getByRole('textbox', { name: /Name/i })
+    const save = form.getByRole('button', { name: 'Save changes' })
+
+    expect(form.getByRole('textbox', { name: /SSH host/i })).toBeInTheDocument()
+    await u.clear(name)
+    expect(save).toBeDisabled()
+    await u.type(name, 'Build box')
+    expect(save).toBeEnabled()
+    await u.click(save)
+
+    await waitFor(() => expect(api.updateInstance).toHaveBeenCalledWith('m1', { name: 'Build box' }))
+    expect(await screen.findByText('Build box')).toBeInTheDocument()
+    expect(screen.queryByText('dev-box-1')).not.toBeInTheDocument()
+  })
+
+  it('keeps the rename draft open and shows an API rejection', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue({
+      active: true,
+      warm_set_cap: 10,
+      instances: [MANUAL_INSTANCE],
+    })
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    vi.mocked(api.updateInstance).mockRejectedValue(new ApiError(409, 'name is already in use'))
+    const u = userEvent.setup()
+    renderWithProviders(<RemoteCrewPanel />)
+
+    await openRowMenu(u, /More actions for dev-box-1/i)
+    await u.click(await screen.findByRole('menuitem', { name: 'Rename' }))
+    const form = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    const name = form.getByRole('textbox', { name: /Name/i })
+    await u.clear(name)
+    await u.type(name, 'Taken name')
+    await u.click(form.getByRole('button', { name: 'Save changes' }))
+
+    expect(await screen.findByText('name is already in use')).toBeInTheDocument()
+    expect(form.getByRole('textbox', { name: /Name/i })).toHaveValue('Taken name')
+  })
+
+  it('restores a rename draft in the shared edit form after a route remount', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue({
+      active: true,
+      warm_set_cap: 10,
+      instances: [MANUAL_INSTANCE],
+    })
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    const u = userEvent.setup()
+    const first = renderWithProviders(<RemoteCrewPanel />)
+
+    await openRowMenu(u, /More actions for dev-box-1/i)
+    await u.click(await screen.findByRole('menuitem', { name: 'Rename' }))
+    const form = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    const name = form.getByRole('textbox', { name: /Name/i })
+    await u.clear(name)
+    await u.type(name, 'Build box')
+
+    first.unmount()
+    renderWithProviders(<RemoteCrewPanel />, { store: first.store })
+
+    const restored = within(
+      await screen.findByRole('group', { name: /Edit dev-box-1/i }),
+    )
+    expect(restored.getByRole('textbox', { name: /Name/i })).toHaveValue('Build box')
+    expect(restored.getByRole('textbox', { name: /SSH host/i })).toBeInTheDocument()
   })
 
   it('shows the install command the gateway reported, not a hardcoded macOS one', async () => {

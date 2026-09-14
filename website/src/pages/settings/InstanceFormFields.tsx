@@ -354,20 +354,22 @@ export function EditInstanceForm({
       ? saveMutation.error.message
       : i18nT('pages.settings.remoteCrewPanel.failed_to_save_crew')
     : ''
+  const formLabel = i18nT('pages.settings.remoteCrewPanel.edit_crew', { name: inst.name })
   return (
     <div
       className="mt-3 rounded-md border border-border bg-bg-elevated p-3"
       role="group"
-      aria-label={i18nT('pages.settings.remoteCrewPanel.edit_crew', { name: inst.name })}
+      aria-label={formLabel}
     >
       <div className="flex items-center gap-2 mb-3 text-text font-medium text-sm">
         <Pencil className="lucide-inline" />{' '}
-        {i18nT('pages.settings.remoteCrewPanel.edit_crew', { name: inst.name })}
+        {formLabel}
       </div>
       <InstanceFormFields
         idPrefix={`edit-instance-${inst.id}`}
         form={form}
         lockTransport={lockTransport}
+        autoFocusName
       />
       {lockTransport && (
         <p className="mt-2 text-[12px] text-warn">
@@ -435,18 +437,21 @@ export function InstanceFormFields({
   idPrefix,
   form,
   lockTransport = false,
+  autoFocusName = false,
 }: {
   idPrefix: string
   form: InstanceFormState
   /** Render the machine-identity fields read-only (see EditInstanceForm). */
   lockTransport?: boolean
+  /** Bring the first field into focus when this form opens inline. */
+  autoFocusName?: boolean
 }) {
   const { values, set, isSsm, portValid, ttlValid } = form
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
       <label htmlFor={`${idPrefix}-name`} className="flex flex-col gap-1 text-[13px] text-muted">
         {i18nT('pages.settings.instancesPanel.name')}
-        <input id={`${idPrefix}-name`} aria-label={i18nT('pages.settings.instancesPanel.name')} className={inputCls} value={values.name} onChange={e => set('name', e.target.value)} placeholder={i18nT('pages.settings.instancesPanel.remote_host_1')} />
+        <input id={`${idPrefix}-name`} aria-label={i18nT('pages.settings.instancesPanel.name')} autoFocus={autoFocusName} className={inputCls} value={values.name} onChange={e => set('name', e.target.value)} placeholder={i18nT('pages.settings.instancesPanel.remote_host_1')} />
       </label>
       {/* Not a <label>: SimpleSelect renders a button, so `htmlFor` would point
           at no form control. The caption text stays put and the accessible name

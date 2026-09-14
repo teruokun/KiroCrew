@@ -71,8 +71,8 @@ describe('instancesSlice', () => {
     expect(s.crewForms.add).toEqual(values)
 
     const draft = { values, baseline: { id: 'c1', name: 'Nimbus' } as never }
-    s = reducer(s, setCrewEditForm({ id: 'c1', draft, seq: 0 }))
-    expect(s.crewForms.edit).toEqual({ id: 'c1', draft, seq: 0 })
+    s = reducer(s, setCrewEditForm({ id: 'c1', draft, seq: 0, mode: 'rename' }))
+    expect(s.crewForms.edit).toEqual({ id: 'c1', draft, seq: 0, mode: 'rename' })
     // The two are independent: dropping one leaves the other standing.
     s = reducer(s, setCrewAddForm(null))
     expect(s.crewForms.add).toBeNull()
