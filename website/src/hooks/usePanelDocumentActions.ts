@@ -5,7 +5,7 @@ import { api } from '../api/client'
 import { clearInlineDraft, getInlineDraft, type usePanelTabs } from './usePanelTabs'
 import { i18nT } from '../i18n/t'
 import type { Artifact } from '../types'
-import { fileReadUrl } from '../utils/fileReadUrl'
+import { fetchFileRead, fileReadQueryKey } from '../utils/fileReadQuery'
 import { errMessage } from '../utils/thunkError'
 import { optsForReplace } from '../pages/chat/replaceGuard'
 
@@ -55,21 +55,10 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
     // switched to mid-load.
     const slot = slotRef.current ?? null
     try {
-      const [{ text, ok, status }] = await Promise.all([
+      const [{ text: raw, ok, status, binary }] = await Promise.all([
         queryClient.fetchQuery({
-          queryKey: ['file-read', filePath],
-          queryFn: async () => {
-            const url = fileReadUrl(filePath)
-            const res = await fetch(url)
-            // A 404 is a real answer about the file (it is not on disk), so the
-            // panel shows that placeholder. Any other failure is an ERROR: it is
-            // reported as one below instead of being rendered as the file's text.
-            const text = res.ok
-              ? await res.text()
-              : res.status === 404 ? i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
-              : ''
-            return { text, ok: res.ok, status: res.status }
-          },
+          queryKey: fileReadQueryKey(filePath),
+          queryFn: ({ signal }) => fetchFileRead(filePath, signal),
           staleTime: 10_000,
         }),
         queryClient.prefetchQuery({
@@ -77,12 +66,21 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
           queryFn: () => api.fileDiff(filePath),
         }),
       ])
+      // A 404 is a real answer about the file (it is not on disk), so the panel
+      // shows that placeholder. Any other failure is an ERROR: reported below
+      // rather than rendered as the file's text. The placeholder is applied HERE
+      // and not inside the shared read, because it is this surface's
+      // presentation choice -- a refresh of an open tab reports the same 404
+      // instead of writing a sentence into the buffer.
+      const text = ok ? raw : status === 404
+        ? i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
+        : ''
       if (!ok && status !== 404) {
         // Read failure — nothing in the viewer to lose, so the notice hands off.
         showActionError(i18nT('pages.chatPage.could_not_read_file_reason', { path: filePath, reason: i18nT('pages.chatPage.http_status', { status }) }))
         return
       }
-      tabsCtl.openFile(filePath, text, slot, optsForReplace(opts))
+      tabsCtl.openFile(filePath, text, slot, { ...optsForReplace(opts), binary })
       onOpened?.()
     } catch (e) {
       // The read itself threw (network, aborted). Reported above the composer

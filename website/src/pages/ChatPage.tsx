@@ -67,7 +67,7 @@ import {
   normalizeAutomationRecord,
   type AutomationRecord,
 } from '../monitoring/automation'
-import { fileReadUrl } from '../utils/fileReadUrl'
+import { fetchFileRead, fileReadQueryKey } from '../utils/fileReadQuery'
 import { safeSetItem, safeSetSessionItem } from '../utils/safeStorage'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
 import { EmptyState, Btn, Input } from '../components/ui'
@@ -3480,17 +3480,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   )
   const coldFileResults = useQueries({
     queries: coldFileTabs.map(t => ({
-      queryKey: ['file-read', t.path!],
-      queryFn: async () => {
-        const res = await fetch(fileReadUrl(t.path!))
-        // Same contract as handleFileOpen: a 404 is a real answer and keeps its
-        // placeholder; any other failure is reported as an error, never as text.
-        const text = res.ok
-          ? await res.text()
-          : res.status === 404 ? i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
-          : ''
-        return { text, ok: res.ok, status: res.status }
-      },
+      queryKey: fileReadQueryKey(t.path!),
+      // The shared read, so this and handleFileOpen cannot disagree about the
+      // shape they both store under this key. The 404 placeholder is applied
+      // below, where the tab is patched -- same split as handleFileOpen.
+      queryFn: ({ signal }) => fetchFileRead(t.path!, signal),
       staleTime: 10_000,
     })),
   })
@@ -3509,7 +3503,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       if (!t || t.content !== undefined) return
       if (r.data && (r.data.ok || r.data.status === 404)) {
         reportedColdReadsRef.current.delete(t.id)
-        tabsCtl.patchTab(t.id, { content: r.data.text, savedContent: r.data.text })
+        const text = r.data.ok
+          ? r.data.text
+          : i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
+        tabsCtl.patchTab(t.id, { content: text, savedContent: text, binary: r.data.binary })
       } else if ((r.data || r.isError) && !reportedColdReadsRef.current.has(t.id)) {
         // The tab stays cold (its buffer untouched, so the next chip/tree click
         // retries the read) and the failure is reported above the composer.

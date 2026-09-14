@@ -60,6 +60,7 @@ import { fileURLToPath } from 'node:url'
 import { serveDist } from './lib/serve-dist.mjs'
 import { logPageProblems, stubDashboardApi, json } from './lib/stub-dashboard-api.mjs'
 import { chromiumExecutable } from './lib/chromium-executable.mjs'
+import { assertRendered } from './lib/frame-assert.mjs'
 
 const OUT = process.argv[2] || '../temp-screenshots/pierre-diffs'
 /** Repo root, derived from this script's own location: the fixtures show a real
@@ -325,32 +326,9 @@ async function main() {
    */
   const MIN_MBPP = 15
 
-  /** Assert each probe is visible with non-empty text; return what was found.
-   *  A probe may name an ATTRIBUTE instead of text (`attr`) — an icon-only
-   *  button or an `<input>` carries no innerText, so demanding text there would
-   *  fail on a perfectly rendered control. */
-  async function assertRendered(name, probes) {
-    const found = []
-    for (const { selector, locator, min = 1, attr } of probes) {
-      const count = await locator.count()
-      if (count < min) {
-        throw new Error(`frame ${name}: probe \`${selector}\` matched ${count} node(s), need >= ${min} — surface did not render; fix the fixture, do not save the frame`)
-      }
-      const texts = []
-      for (let i = 0; i < Math.min(count, min + 2); i++) {
-        const v = attr
-          ? await locator.nth(i).getAttribute(attr).catch(() => null)
-          : await locator.nth(i).innerText().catch(() => '')
-        const t = (v || '').trim()
-        if (t) texts.push(`${attr ? `${attr}=` : ''}${t.replace(/\s+/g, ' ').slice(0, 70)}`)
-      }
-      if (texts.length === 0) {
-        throw new Error(`frame ${name}: probe \`${selector}\` matched ${count} node(s) but every one is EMPTY — blank surface; fix the fixture, do not save the frame`)
-      }
-      found.push({ selector, count, text: texts.join(' ⏐ ') })
-    }
-    return found
-  }
+  // `assertRendered` is gate 1, and it is shared: see ./lib/frame-assert.mjs.
+  // A probe may name an ATTRIBUTE instead of text -- an icon-only button carries
+  // no innerText, so demanding text there would fail on a rendered control.
 
   /** Record a written PNG: edge budget + blank-frame density gate. */
   function record(file, evidence) {
