@@ -42,7 +42,9 @@ def _make_config(agents: dict[str, KiroCrewAgentConfig]) -> KiroCrewConfig:
     return cfg
 
 
-async def _run_sync(cfg: KiroCrewConfig, aim_agents_list: list[AgentInfo]) -> dict:
+async def _run_sync(
+    cfg: KiroCrewConfig, aim_agents_list: list[AgentInfo], *, apps_unreadable: bool = False
+) -> dict:
     """Invoke the production _do_agents_sync with mocked dependencies and return parsed body.
 
     The sync persists via a delta mutate through ``update_config_locked``;
@@ -67,6 +69,10 @@ async def _run_sync(cfg: KiroCrewConfig, aim_agents_list: list[AgentInfo]) -> di
     with (
         patch("kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load", return_value=cfg),
         patch("kiro_crew.dashboard.handlers.agents.list_agents", return_value=aim_agents_list),
+        patch(
+            "kiro_crew.dashboard.handlers.agents.installed_app_names",
+            return_value=None if apps_unreadable else frozenset({"oncall-pack"}),
+        ),
         patch(
             "kiro_crew.dashboard.handlers.agents.update_config_locked",
             new=_fake_update_config_locked,
@@ -135,6 +141,93 @@ class TestAgentSyncPrune:
         assert "stale-aim" in body["pruned"]
         assert "kirocrew" not in body["pruned"]
         assert "kirocrew" in cfg.agents
+
+    @pytest.mark.asyncio
+    async def test_an_apps_agent_whose_file_is_gone_is_pruned_like_a_packages(self):
+        """The sync registers an installed app's agents as ``source="app"``
+        (the discovery names the app that ships the file). Disabling or
+        removing the app deletes the materialized file, so a row left behind
+        would dispatch to a definition that is gone: it is pruned exactly as a
+        package's is, while the user's own rows (``local``) never are."""
+        agents = {
+            "oncall-pack--triage": KiroCrewAgentConfig(
+                kiro_agent="oncall-pack--triage", source="app"
+            ),
+            "mine": KiroCrewAgentConfig(kiro_agent="mine", source="local"),
+        }
+        cfg = _make_config(agents)
+        aim_list = [_make_aim_agent("gpu-dev")]
+
+        body = await _run_sync(cfg, aim_list)
+
+        assert body["pruned"] == ["oncall-pack--triage"]
+        assert "oncall-pack--triage" not in cfg.agents
+        assert "mine" in cfg.agents
+
+    @pytest.mark.asyncio
+    async def test_an_app_row_is_kept_only_by_an_apps_own_file_of_that_name(self):
+        """An ``app`` row survives the prune only when the discovery that
+        answers to its name is ITSELF an app's file. A local or package agent
+        that happens to share the name must not keep the row alive after the
+        app is disabled: the row would then dispatch that unrelated definition
+        in the app agent's name."""
+        agents = {
+            "triage": KiroCrewAgentConfig(kiro_agent="triage", source="app"),
+            "scribe": KiroCrewAgentConfig(kiro_agent="scribe", source="app"),
+        }
+        cfg = _make_config(agents)
+        discovered = [
+            # A user's own file that shares the disabled app agent's name.
+            AgentInfo(
+                name="triage", filename="triage.json", description="", model="", source="local"
+            ),
+            # The app's own file: this row stays.
+            AgentInfo(
+                name="scribe",
+                filename="oncall-pack--scribe.json",
+                description="",
+                model="",
+                source="app",
+                package="oncall-pack",
+            ),
+        ]
+
+        body = await _run_sync(cfg, discovered)
+
+        assert body["pruned"] == ["triage"]
+        assert "triage" not in cfg.agents
+        assert "scribe" in cfg.agents
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_apps_directory_prunes_no_app_row(self):
+        """A failed read of the apps directory is not an empty apps directory:
+        with the failure every app row would read as "its app is gone" and be
+        pruned with its memory archived. App rows are kept until the directory
+        reads again; package rows are still decided as usual."""
+        agents = {
+            "triage": KiroCrewAgentConfig(kiro_agent="oncall-pack--triage", source="app"),
+            "stale-aim": KiroCrewAgentConfig(kiro_agent="stale-aim", source="aim"),
+        }
+        cfg = _make_config(agents)
+        # During the failure the listing classifies the app-shaped file as an
+        # app's (retention-safe) -- and even a listing that did NOT would leave
+        # the row alone, because the decision is keyed on the failure, not on
+        # what the listing says about the file.
+        discovered = [
+            AgentInfo(
+                name="triage",
+                filename="oncall-pack--triage.json",
+                description="",
+                model="",
+                source="local",
+            ),
+            _make_aim_agent("gpu-dev"),
+        ]
+
+        body = await _run_sync(cfg, discovered, apps_unreadable=True)
+
+        assert body["pruned"] == ["stale-aim"]
+        assert "triage" in cfg.agents
 
     @pytest.mark.asyncio
     async def test_prune_skips_user_created_agents(self):

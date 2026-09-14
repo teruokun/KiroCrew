@@ -44,8 +44,10 @@ from kiro_crew.agent import (
 )
 from kiro_crew.agent_capabilities import CapabilityError, require_unmanaged_template
 from kiro_crew.agent_discovery import (
+    AgentInfo,
     _read_agent_spec,
     clear_list_agents_cache,
+    installed_app_names,
     list_agents,
     project_agent_names,
     spec_model,
@@ -4114,10 +4116,24 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
     prune_candidates: dict[str, dict] = {}
     prior_stores: dict[str, str] = {}
     try:
-        discovered_agents = await asyncio.get_running_loop().run_in_executor(
-            discovery_executor(), lambda: list(list_agents())
+
+        def _discover() -> tuple[list[AgentInfo], bool]:
+            # Both off the loop, in one hop: the listing, and whether the apps
+            # directory answered -- ``None`` is a read FAILURE, not "no apps",
+            # and the two must be told apart before any app row is pruned.
+            listed = list(list_agents())
+            return listed, installed_app_names() is None
+
+        discovered_agents, apps_unreadable = await asyncio.get_running_loop().run_in_executor(
+            discovery_executor(), _discover
         )
         discovered_names = {a.name for a in discovered_agents}
+        # The names an installed app's files answer to, kept apart: an "app"
+        # row is retained only by a same-name discovery that is ITSELF an
+        # app's file. A local or package agent that happens to share the
+        # name would otherwise keep the row alive after the app is disabled
+        # -- and the row would dispatch that unrelated definition.
+        discovered_app_names = {a.name for a in discovered_agents if a.source == "app"}
 
         # Add new agents
         mc_kiro_agents = {a.kiro_agent for a in cfg.agents.values()}
@@ -4195,20 +4211,40 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
                 synced.append(disc.name)
 
         # Prune agents whose kiro_agent file no longer exists on disk.
-        # Only prune package-installed agents (never user-created or kirocrew-owned).
-        # Skip pruning if scan returned nothing -- likely a transient issue.
+        # Only prune agents the sync itself registered from an installed package
+        # or app (never user-created or kirocrew-owned). Skip pruning if scan
+        # returned nothing -- likely a transient issue.
         # Invariant: for package-sourced entries, kiro_agent == dict key == agent name.
-        # ("aim" is also accepted for backward-compat with older configs.)
+        # ("aim" is also accepted for backward-compat with older configs.) An
+        # app's agents are registered as "app" (the discovery names the
+        # installed app that ships the file); disabling or removing the app
+        # deletes the materialized file, and a row left behind would dispatch
+        # to a definition that is gone -- so it is pruned like a package's,
+        # and only a discovery that is itself an app's file keeps it.
         # A STARRED package crew is pruned like any other -- a registry row with
         # no spec on disk is not spawnable. The star goes with the row: a
         # reinstalled crew comes back un-starred and one click restores it
         # (deliberately no parking list -- a permanent config key is not worth
         # a re-click, and a name-keyed list would pre-star an unrelated future
         # package that reused the name).
+        if apps_unreadable:
+            # An unreadable apps directory is not an empty one: every app row
+            # would read as "its app is gone" and be pruned with its memory
+            # archived. App rows are left exactly as they are until the
+            # directory reads again; package rows are decided as usual.
+            logger.warning(
+                "agents sync: the apps directory could not be read; app members are "
+                "kept until it can"
+            )
         if discovered_names:
             for name, agent_cfg in list(cfg.agents.items()):
-                if agent_cfg.source in ("package", "aim") and (
-                    agent_cfg.kiro_agent not in discovered_names
+                if agent_cfg.source == "app" and apps_unreadable:
+                    continue
+                still_shipped = (
+                    discovered_app_names if agent_cfg.source == "app" else discovered_names
+                )
+                if agent_cfg.source in ("package", "aim", "app") and (
+                    agent_cfg.kiro_agent not in still_shipped
                 ):
                     # Record the SNAPSHOT entry: the locked mutate below only
                     # prunes a name whose in-lock entry still equals this one,
