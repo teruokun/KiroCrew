@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient, useIsMutating, useMutationState } from '@tanstack/react-query'
 import { Download, Loader2, RefreshCw, Sparkles } from 'lucide-react'
 import { api, ApiError } from '../../api/client'
 import ProjectSkillsTrustList from '../../components/ProjectSkillsTrustList'
@@ -11,6 +11,7 @@ import SkillForm, { assembleSkillContent, parseSkillContent, skillPathProblem, s
 import SkillDirectoryBrowser from '../../components/SkillDirectoryBrowser'
 import SkillBrowserModal from '../../components/SkillBrowserModal'
 import DiffBlock from '../../components/DiffBlock'
+import ErrorNotice from '../../components/ErrorNotice'
 import ListDetailBack from '../../components/ListDetailBack'
 import { useListDetailView } from '../../hooks/useListDetailView'
 import { useProvider } from '../../providers'
@@ -480,6 +481,21 @@ interface PendingSkill {
   /** For updates: the live skill this proposes to change (e.g. 'auto/deploy'). */
   target?: string | null
   base_version?: number | null
+  /**
+   * When this candidate was staged. The queue has always returned it
+   * (`skills.py` `list_pending_skills`); it is declared here because it is the
+   * only thing that tells two GENERATIONS of one slug apart.
+   *
+   * A slug is reusable: the backend stages a distinct slug while one is in use,
+   * but once a candidate is approved or dismissed its slug is free, and a later
+   * candidate takes it with a fresh timestamp. Without the generation, that
+   * successor inherits its predecessor's row instance (so it renders already
+   * expanded) and its predecessor's cached detail (so the panel shows the OLD
+   * body while Approve promotes the NEW one, scripts and all) -- approving
+   * something nobody reviewed, which is the defect this whole surface exists to
+   * prevent.
+   */
+  created_at?: string
 }
 interface PendingDetail {
   name: string
@@ -495,10 +511,14 @@ interface PendingDetail {
   stale_base?: boolean
 }
 
-function PendingCandidateRow({ p, autoOpen, onApprove, onDismiss }: {
+function PendingCandidateRow({ p, autoOpen, busy, busySelf, onApprove, onDismiss }: {
   p: PendingSkill
   /** True when a notification deep-linked at THIS candidate (?review=<slug>). */
   autoOpen?: boolean
+  /** An action is in flight SOMEWHERE in the queue — see the panel's comment. */
+  busy?: boolean
+  /** …and it is this row's own action, so this row shows the progress. */
+  busySelf?: boolean
   onApprove: (slug: string) => void
   onDismiss: (slug: string) => void
 }) {
@@ -520,10 +540,27 @@ function PendingCandidateRow({ p, autoOpen, onApprove, onDismiss }: {
   }, [autoOpen])
   const isUpdate = p.kind === 'update'
   const { data: detail } = useQuery<PendingDetail>({
-    queryKey: ['skills-pending-detail', p.slug],
+    // The generation is part of the key, so a successor under the same slug can
+    // never be served its predecessor's body -- on any path, including the 30s
+    // staleTime window and the deep link. The panel's `removeQueries` /
+    // `invalidateQueries` calls match on the `['skills-pending-detail', slug]`
+    // PREFIX, so they still reach every generation of a slug.
+    queryKey: ['skills-pending-detail', p.slug, p.created_at ?? ''],
     queryFn: () => api.skillPendingDetail(p.slug),
     enabled: open,
   })
+  // Why this candidate cannot be approved, as ONE value rather than a condition
+  // on the button and a notice somewhere else in the panel. The backend refuses
+  // both cases, so the same expression has to decide the disabled state and the
+  // sentence that explains it — computing them separately is how the two drift
+  // apart and a disabled button loses its caption.
+  const refusal = !isUpdate || !detail
+    ? null
+    : !detail.diff
+      ? i18nT('pages.overview.skillsTab.the_skill_this_update_targets_no_longer_exists_s')
+      : detail.stale_base
+        ? i18nT('pages.overview.skillsTab.this_skill_changed_after_this_update_was_written')
+        : null
   return (
     <div ref={rowRef} className={`p-2 rounded-md border ${autoOpen ? 'border-accent ring-1 ring-accent' : 'border-border'}`}>
       <div className="flex items-center gap-3">
@@ -548,13 +585,19 @@ function PendingCandidateRow({ p, autoOpen, onApprove, onDismiss }: {
               : p.description}
           </div>
         </div>
-        <Btn onClick={() => setOpen(o => !o)}>{open ? i18nT('pages.overview.skillsTab.hide') : i18nT('pages.overview.skillsTab.review')}</Btn>
-        {/* An update whose target was archived/removed after staging has nothing
-            to apply, and a stale update (live moved on since the merge) would
-            replace the newer approved content — the backend refuses both, so keep
-            the button disabled and let the expanded panel explain. */}
-        <Btn primary disabled={!open || !detail || (isUpdate && (!detail.diff || !!detail.stale_base))} onClick={() => onApprove(p.slug)}>{i18nT('pages.overview.skillsTab.approve')}</Btn>
-        <Btn danger onClick={() => { if (confirm(i18nT('pages.overview.skillsTab.dismiss_confirm', { name: p.name }))) onDismiss(p.slug) }}>{i18nT('pages.overview.skillsTab.dismiss')}</Btn>
+        {/* Review is the row's PRIMARY action while collapsed, and Approve is not
+            rendered at all until the panel is open. The previous layout showed a
+            greyed-out Approve beside Review on every collapsed row, which reads as
+            a broken button rather than as a rule: approval is gated on having seen
+            the content, and nothing said so. Moving Approve into the panel makes
+            the gate the shape of the UI instead of a disabled state needing a
+            caption, and keeps the row at the two-buttons-per-row maximum. */}
+        <Btn primary={!open} onClick={() => setOpen(o => !o)}>{open ? i18nT('pages.overview.skillsTab.hide') : i18nT('pages.overview.skillsTab.review')}</Btn>
+        {busySelf && <Loader2 size={14} className="animate-spin text-accent" aria-hidden="true" data-testid="pending-action-spinner" />}
+        {/* Pushed away from Review/Hide: one collapses a row, the other discards
+            a candidate, and at equal weight and adjacency a reader hesitates over
+            which is which. */}
+        <Btn danger className="ml-3" disabled={busy} onClick={() => { if (confirm(i18nT('pages.overview.skillsTab.dismiss_confirm', { name: p.name }))) onDismiss(p.slug) }}>{i18nT('pages.overview.skillsTab.dismiss')}</Btn>
       </div>
       {open && detail && (
         <div className="mt-2 space-y-2">
@@ -567,11 +610,6 @@ function PendingCandidateRow({ p, autoOpen, onApprove, onDismiss }: {
               {i18nT('pages.overview.skillsTab.scripts_always_require_review')}
             </div>
           )}
-          {isUpdate && detail.stale_base && (
-            <div className="text-[11px] p-2 rounded bg-warn-subtle text-warn border border-border">
-              {i18nT('pages.overview.skillsTab.this_skill_changed_after_this_update_was_written')}
-            </div>
-          )}
           {isUpdate && detail.diff ? (
             <>
               <div className="text-[11px] font-semibold text-muted">
@@ -581,11 +619,7 @@ function PendingCandidateRow({ p, autoOpen, onApprove, onDismiss }: {
               </div>
               <DiffBlock code={detail.diff} complete />
             </>
-          ) : isUpdate ? (
-            <div className="text-[11px] p-2 rounded bg-bg-elevated border border-border text-muted">
-              {i18nT('pages.overview.skillsTab.the_skill_this_update_targets_no_longer_exists_s')}
-            </div>
-          ) : (
+          ) : isUpdate ? null : (
             <>
               <div className="text-[11px] font-semibold text-muted">{i18nT('pages.overview.skillsTab.skill_md')}</div>
               <pre className="text-[11px] whitespace-pre-wrap max-h-64 overflow-auto p-2 rounded bg-bg-elevated border border-border">{detail.content}</pre>
@@ -597,11 +631,33 @@ function PendingCandidateRow({ p, autoOpen, onApprove, onDismiss }: {
               <pre className="text-[11px] whitespace-pre-wrap max-h-64 overflow-auto p-2 rounded bg-bg-elevated border border-border">{s.content}</pre>
             </div>
           ))}
+          {/* Approve sits at the END of the content it approves, so the click is
+              reached by scrolling past the body/diff rather than offered beside a
+              collapsed row. The refusal sentence sits in this same block, NOT at
+              the top of the panel: a stale update renders a full diff, and a
+              reason printed above that diff has scrolled out of view by the time
+              the user reaches the button it disables — which is the very
+              unexplained-disabled shape this row was changed to remove. */}
+          <div className="flex items-center justify-end gap-2 pt-0.5">
+            {refusal && (
+              <div className="text-[11px] p-2 rounded bg-warn-subtle text-warn border border-border flex-1">
+                {refusal}
+              </div>
+            )}
+            <Btn primary disabled={!!refusal || busy} onClick={() => onApprove(p.slug)}>{i18nT('pages.overview.skillsTab.approve')}</Btn>
+          </div>
         </div>
       )}
     </div>
   )
 }
+
+/**
+ * The one mutation key every queue action shares, so "is an action in flight"
+ * is a question about the mutation cache rather than about any one component's
+ * lifetime.
+ */
+const QUEUE_ACTION_KEY = ['skills-pending-action'] as const
 
 function PendingSkillsPanel() {
   const qc = useQueryClient()
@@ -642,8 +698,82 @@ function PendingSkillsPanel() {
     refetchOnMount: 'always',
   })
   const pending: PendingSkill[] = data?.pending ?? []
+  // ONE guard for "the queue takes one action at a time", and it lives in
+  // react-query's mutation cache rather than in this component.
+  //
+  // Two earlier attempts at this rule failed for the same reason: they were
+  // component state. `isPending` is render-derived, so it cannot see a second
+  // activation in the same task — measured: three synchronous Approve clicks
+  // sent three requests. A `useRef` latch fixed that but died with the
+  // component, so switching Capabilities tabs mid-request and coming back
+  // handed the queue a fresh, unlocked latch while the first request was still
+  // running. The mutation cache has neither problem: `isMutating` is registered
+  // synchronously by `mutate()` (verified) and outlives this panel's mount.
+  //
+  // Why one action at a time at all: each hook renders only its LATEST call, so
+  // a second attempt detaches the first, and the detached one can fail with
+  // nothing on screen saying so. Two attempts on one candidate is worse still —
+  // the loser is refused, and that refusal can be the only thing shown for an
+  // approval that in fact succeeded.
+  const queueBusy = useIsMutating({ mutationKey: QUEUE_ACTION_KEY }) > 0
+  // The slug of whatever attempt is in flight, from the cache rather than from a
+  // hook, for the same lifetime reason.
+  const pendingActionSlugs = useMutationState({
+    filters: { mutationKey: QUEUE_ACTION_KEY, status: 'pending' },
+    select: m => m.state.variables as string | undefined,
+  })
+  // …and the failures, for the same reason again. A hook's error dies with the
+  // component: leave the Skills tab while a request is in flight and the
+  // remounted hooks start idle, so the rejection that arrived meanwhile is never
+  // shown — the user is told nothing about an action they started. The cache
+  // outlives the mount, so the message survives being away from the tab.
+  const failedActions = useMutationState({
+    filters: { mutationKey: QUEUE_ACTION_KEY, status: 'error' },
+    select: m => ({
+      message: (m.state.error as Error | null)?.message,
+      slug: m.state.variables as string | undefined,
+    }),
+  })
+  // The most recent one: insertion order, and only the latest attempt is the one
+  // the user is waiting on.
+  const failedAction = failedActions[failedActions.length - 1]
+  // Cache-owned state has to be cleared deliberately, where a hook's error was
+  // discarded for us. Both callers are honest: the user dismissing the notice,
+  // and the next attempt starting.
+  const clearFailedActions = () => {
+    const cache = qc.getMutationCache()
+    cache.findAll({ mutationKey: QUEUE_ACTION_KEY, status: 'error' }).forEach(m => cache.remove(m))
+  }
+  const startAction = (run: () => void) => {
+    if (qc.isMutating({ mutationKey: QUEUE_ACTION_KEY })) return
+    clearFailedActions()
+    run()
+  }
+  /**
+   * Reconcile the queue against the server when an action FAILS.
+   *
+   * Without this the refusal contradicts the screen: "this candidate is no
+   * longer pending" renders above the very row it names, still carrying a live
+   * Approve and the old count, until the 30s poll happens to catch up. A reader
+   * shown that state does not press the button — and cannot tell which half is
+   * lying. Refetching on failure is also the honest reading of a refusal: the
+   * server has just told us our list is wrong, so the row leaves and the notice
+   * is left as the explanation for where it went.
+   */
+  const reconcileAfterFailure = (slug?: string) => {
+    // INVALIDATE the detail rather than remove it: removing evicts the body the
+    // open panel is rendering, so Approve and the content vanish for a beat and
+    // come back — a flash of nothing on the row the user is reading. Invalidating
+    // refetches underneath the visible data. (The success paths do remove it, for
+    // a different reason: there the candidate is gone and its slug may be
+    // re-staged, so stale detail must not survive.)
+    if (slug) qc.invalidateQueries({ queryKey: ['skills-pending-detail', slug] })
+    qc.invalidateQueries({ queryKey: ['skills-pending'] })
+  }
   const approve = useMutation({
+    mutationKey: QUEUE_ACTION_KEY,
     mutationFn: (slug: string) => api.approvePendingSkill(slug),
+    onError: (_e, slug) => reconcileAfterFailure(slug),
     onSuccess: (_data, slug) => {
       // Drop the deep-link latch when the user acts on the linked candidate
       // THEMSELVES. Without this, approving the row you arrived at makes the
@@ -665,7 +795,9 @@ function PendingSkillsPanel() {
     },
   })
   const dismiss = useMutation({
+    mutationKey: QUEUE_ACTION_KEY,
     mutationFn: (slug: string) => api.dismissPendingSkill(slug),
+    onError: (_e, slug) => reconcileAfterFailure(slug),
     onSuccess: (_data, slug) => {
       // Same reason as approve: a dismissal the user just performed must not
       // come back as "someone resolved this already".
@@ -678,13 +810,28 @@ function PendingSkillsPanel() {
     },
   })
   const dismissAll = useMutation({
+    mutationKey: QUEUE_ACTION_KEY,
     mutationFn: () => api.dismissAllPendingSkills(pending.map(p => p.slug)),
+    onError: () => reconcileAfterFailure(),
     onSuccess: () => {
       setReviewSlug(null)
       qc.removeQueries({ queryKey: ['skills-pending-detail'] })
       qc.invalidateQueries({ queryKey: ['skills-pending'] })
     },
   })
+  // The queue takes ONE action at a time. Each mutation hook holds the state of
+  // its latest call, so a second attempt started before the first settles
+  // detaches the first: that request can then fail with nothing rendering its
+  // failure, which is the silent-refusal defect this panel was changed to remove,
+  // reappearing only when two actions overlap. Serialising the controls removes
+  // the overlap rather than tracking it — with at most one attempt in flight,
+  // the hook's single error slot always belongs to the attempt the user is
+  // waiting on. The actions are one request long, so the lock is imperceptible
+  // except as the spinner on the row that owns it.
+  const busy = queueBusy
+  // The slug of the attempt in flight, read from the cache for the same reason:
+  // after a remount the hooks are fresh, but the request is not.
+  const busySlug = pendingActionSlugs[0]
   // Only claim a deep-linked candidate is gone once the queue has actually been
   // read -- `pending` is [] while the first fetch is in flight, which would
   // otherwise flash the notice on every deep link.
@@ -692,7 +839,14 @@ function PendingSkillsPanel() {
   // Without the notice a deep link from a notification whose candidate was
   // already resolved lands on a Skills tab that looks completely normal, and
   // the user is left hunting for a row that no longer exists.
-  if (pending.length === 0 && !reviewMissing) return null
+  //
+  // The panel also stays rendered while it OWES the user a message. Approving the
+  // last candidate empties the queue, and a failure that lands after the queue
+  // went empty — another client resolved it, the refetch returned nothing — would
+  // otherwise have nowhere to appear: this early return would have already
+  // replaced the only surface that could carry it with null.
+  const owesMessage = busy || !!failedAction
+  if (pending.length === 0 && !reviewMissing && !owesMessage) return null
   // No top margin on the root, for the same reason as the tab's heading below:
   // this panel is the Skills tab's FIRST in-flow element whenever it renders,
   // and the pane already owns the gap under the tab strip. It is also WHY that
@@ -708,7 +862,7 @@ function PendingSkillsPanel() {
         <h4 className="text-sm font-semibold text-text-strong mb-2 flex items-center gap-2">
           {i18nT('pages.overview.skillsTab.pending_review_count', { count: pending.length })}
           <InfoTip text={i18nT('pages.overview.skillsTab.auto_generated_skill_candidates_awaiting_your_ap')} />
-          <Btn danger className="ml-auto text-[11px]" onClick={() => { if (confirm(i18nT('pages.overview.skillsTab.dismiss_all_confirm', { count: pending.length }))) dismissAll.mutate() }}>{i18nT('pages.overview.skillsTab.dismiss_all')}</Btn>
+          <Btn danger disabled={busy} className="ml-auto text-[11px]" onClick={() => { if (confirm(i18nT('pages.overview.skillsTab.dismiss_all_confirm', { count: pending.length }))) startAction(() => dismissAll.mutate()) }}>{i18nT('pages.overview.skillsTab.dismiss_all')}</Btn>
         </h4>
       )}
       {pending.length > 0 && (
@@ -721,16 +875,40 @@ function PendingSkillsPanel() {
           {i18nT('pages.overview.skillsTab.linked_candidate_no_longer_pending')}
         </div>
       )}
+      {/* A failed approve / dismiss belongs to the ATTEMPT, not to a row, and
+          not to this component's mount either. Both were tried: a per-candidate
+          store had to be re-judged every time the queue moved under it (it
+          mis-attributed twice), and hook-held state was discarded the moment the
+          user left the tab. So the mutation cache owns it, and the sentence is
+          "<slug> — <what the server said>", which stays true however the queue
+          has since changed and whichever tab the user is on when it lands.
+
+          `askAgent` is on: the queue holds no draft input and the candidate is
+          already persisted server-side, so the hand-off destroys nothing — and a
+          refusal the user cannot act on is often one the agent can. */}
+      <ErrorNotice
+        message={failedAction?.message}
+        title={failedAction?.slug}
+        askAgent
+        onDismiss={clearFailedActions}
+        className="mb-2"
+        testId="pending-action-error"
+      />
       {pending.length > 0 && (
         <Card>
           <div className="space-y-2">
             {pending.map(p => (
               <PendingCandidateRow
-                key={p.slug}
+                // Generation in the key: a successor under a reused slug is a
+                // DIFFERENT candidate, so it must mount fresh and collapsed
+                // rather than inherit the expanded state of the row it replaced.
+                key={`${p.slug}@${p.created_at ?? ''}`}
                 p={p}
                 autoOpen={p.slug === reviewSlug}
-                onApprove={s => approve.mutate(s)}
-                onDismiss={s => dismiss.mutate(s)}
+                busy={busy}
+                busySelf={busySlug === p.slug}
+                onApprove={s => startAction(() => approve.mutate(s))}
+                onDismiss={s => startAction(() => dismiss.mutate(s))}
               />
             ))}
           </div>
