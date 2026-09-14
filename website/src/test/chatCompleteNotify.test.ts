@@ -28,6 +28,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { store as globalStore } from '../store'
 import { sseSlots } from '../store/dashboardSlice'
 import { useWebSocket } from '../hooks/useWebSocket'
+import { MC_NOTIFICATION_EVENT, type McNotificationDetail } from '../hooks/notificationEvent'
 import {
   CHAT_COMPLETE_NOTIFY_KEY,
   loadChatCompleteNotify,
@@ -222,6 +223,51 @@ describe('useWebSocket chat_done native toast', () => {
     // Per-slot, so two sessions finishing while away produce two toasts rather
     // than one overwriting the other.
     expect(CONSTRUCTED[0].options?.tag).toBe('kirocrew-chat-done:slot-a')
+  })
+
+  it('does not toast for an intermediate turn even when desktop alerts are enabled', () => {
+    saveChatCompleteNotify(true)
+    const ws = mountOpened()
+    seedSlot('slot-a', 'Refactor the planner')
+
+    act(() => { ws.simulateMessage({ type: 'chat_done', data: { slot: 'slot-a', continuing: true } }) })
+    expect(CONSTRUCTED).toEqual([])
+
+    act(() => { ws.simulateMessage({ type: 'chat_done', data: { slot: 'slot-a', continuing: false } }) })
+    expect(CONSTRUCTED).toHaveLength(1)
+  })
+
+  it.each([
+    { continuing: false, needs_input: true },
+    { continuing: true, needs_input: true },
+    {},
+  ])('keeps the question handoff toast without a second sound for %j', frame => {
+    saveChatCompleteNotify(true)
+    const ws = mountOpened()
+    seedSlot('slot-question', 'Choose the approach')
+    const kinds: (string | undefined)[] = []
+    const onSound = (event: Event) => kinds.push((event as CustomEvent<McNotificationDetail>).detail.kind)
+    window.addEventListener(MC_NOTIFICATION_EVENT, onSound)
+    try {
+      act(() => { ws.simulateMessage({ type: 'question_card', data: {
+        slot: 'slot-question', card_id: 'question-toast',
+        questions: [{ question: 'Which approach?', options: [{ label: 'Use A' }] }],
+      } }) })
+      expect(kinds).toEqual(['approval'])
+      expect(CONSTRUCTED).toEqual([])
+
+      act(() => { ws.simulateMessage({ type: 'chat_done', data: { slot: 'slot-question', ...frame } }) })
+      expect(kinds).toEqual(['approval'])
+      expect(CONSTRUCTED).toHaveLength(1)
+      expect(CONSTRUCTED[0].title).toBe('Choose the approach')
+      expect(CONSTRUCTED[0].options?.tag).toBe('kirocrew-chat-done:slot-question')
+      expect(CONSTRUCTED[0].options?.silent).toBe(true)
+    } finally {
+      window.removeEventListener(MC_NOTIFICATION_EVENT, onSound)
+      act(() => { ws.simulateMessage({ type: 'question_card_resolved', data: {
+        slot: 'slot-question', card_id: 'question-toast',
+      } }) })
+    }
   })
 
   it('falls back to the slot key when the session has no title', () => {
