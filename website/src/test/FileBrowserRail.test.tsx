@@ -3,10 +3,12 @@
  *
  * Pins the parts of the rail that no other suite owns: the All/Changed segment
  * (whose mode is MODULE-level session state, so it must survive a remount), the
- * always-open search field feeding the tree's search session, the refresh
- * escape hatch, and the grip's clamp + persistence. The Pierre tree is replaced
- * by a probe that echoes the props it was handed, so "what the rail tells the
- * tree" is assertable without loading the trees runtime.
+ * always-open search field feeding the tree's search session, the Name/Content
+ * toggle and the content-search results list, the refresh escape hatch, and the
+ * grip's clamp + persistence. The Pierre tree is replaced by a probe that echoes
+ * the props it was handed, so "what the rail tells the tree" is assertable
+ * without loading the trees runtime, and `/api/file-grep` is stubbed so the
+ * results list is asserted against a known payload rather than a live walk.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import {
@@ -21,9 +23,12 @@ const H = vi.hoisted(() => ({
     projectTree: vi.fn(),
     projectGitStatus: vi.fn(),
   },
+  fileGrep: vi.fn(),
 }))
 
 vi.mock('../api/client', () => ({ api: H.api }))
+
+vi.mock('../api/fileGrep', () => ({ fileGrep: H.fileGrep }))
 
 vi.mock('../pierre/tree', () => ({
   TreeSkeleton: () => null,
@@ -74,18 +79,22 @@ beforeEach(() => {
   localStorage.clear()
   H.api.projectTree.mockReset().mockResolvedValue({ root: DIR, paths: [], repo: true })
   H.api.projectGitStatus.mockReset().mockResolvedValue({ repo: true, files: [] })
-  // The All/Changed mode lives in a module-level variable so in-place tab
-  // navigation (which remounts the rail) keeps it — which also means a prior
-  // test's toggle survives into this one. Drive it back to All explicitly.
+  H.fileGrep.mockReset().mockResolvedValue({
+    results: [], truncated: false, engine: 'rg', skipped_docs: 0, root: DIR,
+  })
+  // Three pieces of the rail's state are MODULE-level so that in-place tab
+  // navigation (which remounts the rail) keeps them — which also means a prior
+  // test's toggle or typed filter survives into this one. Drive all three back
+  // to their defaults on one mount, search MODE first: the field's label is
+  // mode-dependent, so the filter cannot be found until Name is showing again.
   mount()
+  fireEvent.click(screen.getByLabelText('Search file names'))
   fireEvent.click(screen.getByLabelText('All files'))
-  // The filter lives in a module-level map keyed by projectDir (it must
-  // survive the rail's remount), so a prior test's typed filter survives into
-  // this one — drive it back to empty the same way the mode is driven to All.
   fireEvent.change(screen.getByLabelText('Filter files…'), { target: { value: '' } })
   cleanup()
   H.api.projectTree.mockClear()
   H.api.projectGitStatus.mockClear()
+  H.fileGrep.mockClear()
 })
 
 describe('FileBrowserRail mode segment', () => {
@@ -258,6 +267,10 @@ describe('FileBrowserRail refresh', () => {
     expect(spy.mock.calls.map(c => (c[0] as { queryKey: unknown[] }).queryKey)).toEqual([
       ['project-tree', DIR],
       ['git-status', DIR],
+      // Content results are cached, so the escape hatch has to reach them too:
+      // a refresh that left a stale hit list beside a fresh tree would present
+      // two different answers to one query.
+      ['file-grep', DIR],
     ])
     await waitFor(() => expect(btn).toBeDisabled())
     expect(btn.querySelector('svg')?.getAttribute('class')).toContain('animate-spin')
@@ -342,5 +355,245 @@ describe('useTreeAvailable', () => {
     const { result } = renderHook(() => useTreeAvailable(null), { wrapper: wrapper(newClient()) })
     expect(result.current).toBe(false)
     expect(H.api.projectTree).not.toHaveBeenCalled()
+  })
+})
+
+/** A payload with one text hit and one document hit — the two row shapes. */
+const GREP_PAYLOAD = {
+  results: [
+    { file: '/repo/src/a.ts', line: 12, preview: 'const NEEDLE = 1' },
+    { file: '/repo/docs/spec.pptx', line: 0, preview: 'the needle roadmap', label: 'slide 7' },
+  ],
+  truncated: false,
+  engine: 'rg' as const,
+  skipped_docs: 0,
+  root: DIR,
+}
+
+/** Switch to Content mode and type *query*, then wait for the debounced fetch. */
+async function searchContents(query: string) {
+  fireEvent.click(screen.getByLabelText('Search file contents'))
+  fireEvent.change(screen.getByLabelText('Search in files…'), { target: { value: query } })
+  await waitFor(() => expect(H.fileGrep).toHaveBeenCalled())
+}
+
+describe('FileBrowserRail search-mode toggle', () => {
+  it('starts on Name, where the query filters the tree and no content search runs', () => {
+    mount()
+    expect(screen.getByLabelText('Search file names')).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByLabelText('Search file contents')).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.change(screen.getByLabelText('Filter files…'), { target: { value: 'needle' } })
+    expect(tree()).toHaveAttribute('data-query', 'needle')
+    expect(H.fileGrep).not.toHaveBeenCalled()
+  })
+
+  it('replaces the tree with content results in Content mode', async () => {
+    H.fileGrep.mockResolvedValue(GREP_PAYLOAD)
+    mount()
+    await searchContents('needle')
+    // The tree is not merely hidden: the rail has one body, and a stale tree
+    // beside a hit list would leave two competing answers to one query.
+    await waitFor(() => expect(screen.queryByTestId('tree')).toBeNull())
+  })
+
+  it('keeps Content mode across a remount', async () => {
+    H.fileGrep.mockResolvedValue(GREP_PAYLOAD)
+    mount()
+    fireEvent.click(screen.getByLabelText('Search file contents'))
+    cleanup()
+    mount()
+    expect(screen.getByLabelText('Search file contents')).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  it('asks for nothing below the two-character floor', async () => {
+    mount()
+    fireEvent.click(screen.getByLabelText('Search file contents'))
+    fireEvent.change(screen.getByLabelText('Search in files…'), { target: { value: 'n' } })
+    // The hint stands in for the results list, so an empty rail never reads as
+    // "searched and found nothing".
+    expect(screen.getByText(/at least two characters/i)).toBeInTheDocument()
+    await new Promise(r => setTimeout(r, 320))
+    expect(H.fileGrep).not.toHaveBeenCalled()
+  })
+
+  it('debounces to ONE request for a burst of keystrokes', async () => {
+    H.fileGrep.mockResolvedValue(GREP_PAYLOAD)
+    mount()
+    fireEvent.click(screen.getByLabelText('Search file contents'))
+    const field = screen.getByLabelText('Search in files…')
+    for (const value of ['ne', 'nee', 'need', 'needl', 'needle']) {
+      fireEvent.change(field, { target: { value } })
+    }
+    await waitFor(() => expect(H.fileGrep).toHaveBeenCalledTimes(1))
+    expect(H.fileGrep.mock.calls[0][0]).toBe(DIR)
+    expect(H.fileGrep.mock.calls[0][1]).toBe('needle')
+  })
+})
+
+describe('FileBrowserRail content results', () => {
+  it('shortens each path against the searched root and marks the match', async () => {
+    H.fileGrep.mockResolvedValue(GREP_PAYLOAD)
+    mount()
+    await searchContents('needle')
+    expect(await screen.findByText('src/a.ts')).toBeInTheDocument()
+    expect(screen.getByText('docs/spec.pptx')).toBeInTheDocument()
+    // The file's own casing survives: the run is located case-insensitively but
+    // sliced out of the original text.
+    expect(rail().querySelector('mark')?.textContent).toBe('NEEDLE')
+  })
+
+  it('shows :line for a text hit and the location badge for a document hit', async () => {
+    H.fileGrep.mockResolvedValue(GREP_PAYLOAD)
+    mount()
+    await searchContents('needle')
+    expect(await screen.findByText(':12')).toBeInTheDocument()
+    // A .pptx has no line to open at, so the row names the slide instead.
+    expect(screen.getByText('slide 7')).toBeInTheDocument()
+  })
+
+  it('opens a text hit at its line', async () => {
+    H.fileGrep.mockResolvedValue(GREP_PAYLOAD)
+    const onFileOpen = vi.fn()
+    mount({ onFileOpen })
+    await searchContents('needle')
+    fireEvent.click(await screen.findByText('src/a.ts'))
+    expect(onFileOpen).toHaveBeenCalledWith('/repo/src/a.ts', false, { line: 12 })
+  })
+
+  it('opens a document hit without a line to reveal', async () => {
+    H.fileGrep.mockResolvedValue(GREP_PAYLOAD)
+    const onFileOpen = vi.fn()
+    mount({ onFileOpen })
+    await searchContents('needle')
+    fireEvent.click(await screen.findByText('docs/spec.pptx'))
+    // Line 0 is not a line: asking the panel to reveal it would scroll to a
+    // position the file does not have.
+    expect(onFileOpen).toHaveBeenCalledWith('/repo/docs/spec.pptx', false, undefined)
+  })
+
+  it('reports the count, and keeps the engine name out of the line', async () => {
+    H.fileGrep.mockResolvedValue(GREP_PAYLOAD)
+    mount()
+    await searchContents('needle')
+    const status = await waitFor(() => {
+      const el = screen.getByTestId('file-grep-status')
+      expect(el.textContent).toMatch(/2 result/i)
+      return el
+    })
+    // "python" in the visible line was read as "the search was narrowed to
+    // Python files", i.e. as a filter that made the list incomplete. The engine
+    // is diagnostic, so it answers "why was that slow" from the tooltip instead.
+    expect(status.textContent).not.toContain('rg')
+    expect(status).toHaveAttribute('title', expect.stringContaining('rg'))
+  })
+
+  it('says the search was capped rather than presenting a partial list as complete', async () => {
+    H.fileGrep.mockResolvedValue({ ...GREP_PAYLOAD, truncated: true, engine: 'python' })
+    mount()
+    await searchContents('needle')
+    const status = await waitFor(() => {
+      const el = screen.getByTestId('file-grep-status')
+      expect(el.textContent).toContain('capped')
+      return el
+    })
+    // The remedy is visible and keyboard-readable; only the engine stays in
+    // the diagnostic tooltip.
+    expect(await screen.findByText(/Narrow the query/i)).toBeVisible()
+    expect(status).toHaveAttribute('title', expect.stringContaining('python'))
+  })
+
+  it('names BOTH modes in words, whichever is active', async () => {
+    mount()
+    // An icon pair was misread; an icon pair with only the active word was
+    // still misread. Two plain words on their own row: nothing left to guess,
+    // and the search field keeps its full width for the query.
+    expect(screen.getByLabelText('Search file names')).toHaveTextContent('Name')
+    expect(screen.getByLabelText('Search file contents')).toHaveTextContent('Content')
+    fireEvent.click(screen.getByLabelText('Search file contents'))
+    expect(screen.getByLabelText('Search file names')).toHaveTextContent('Name')
+    expect(screen.getByLabelText('Search file contents')).toHaveTextContent('Content')
+    // The toggle is no longer INSIDE the search field.
+    const field = screen.getByLabelText('Search in files…').parentElement as HTMLElement
+    expect(within(field).queryByLabelText('Search file names')).toBeNull()
+  })
+
+  it('says visibly, once, that non-PDF document hits open from the start', async () => {
+    H.fileGrep.mockResolvedValue(GREP_PAYLOAD)
+    mount()
+    await searchContents('needle')
+    // A `slide 7` badge reads as a jump target the click cannot honour. The
+    // correction is visible text above the list -- not a hover tooltip, which
+    // has no affordance and no keyboard path.
+    await screen.findByText('slide 7')
+    expect(screen.getByTestId('file-grep-doc-note')).toHaveTextContent(/open the document from the start/)
+  })
+
+  it('opens a PDF hit at its page, through the same reveal channel as a line', async () => {
+    H.fileGrep.mockResolvedValue({
+      ...GREP_PAYLOAD,
+      results: [{ file: '/repo/docs/spec.pdf', line: 0, preview: 'needle on page three', label: 'p 3' }],
+    })
+    const onFileOpen = vi.fn()
+    mount({ onFileOpen })
+    await searchContents('needle')
+    fireEvent.click(await screen.findByText('docs/spec.pdf'))
+    // `p 3` is the one document location a viewer can honour (#page=3), so the
+    // click carries it in the reveal slot the panel already has.
+    expect(onFileOpen).toHaveBeenCalledWith('/repo/docs/spec.pdf', false, { line: 3 })
+    // ... and a PDF-only result set needs no "opens from the start" note.
+    expect(screen.queryByTestId('file-grep-doc-note')).toBeNull()
+  })
+
+  it('names the documents the budget did not reach', async () => {
+    H.fileGrep.mockResolvedValue({ ...GREP_PAYLOAD, skipped_docs: 4 })
+    mount()
+    await searchContents('needle')
+    await waitFor(() =>
+      expect(screen.getByTestId('file-grep-status').textContent)
+        .toContain('documents not searched: 4'))
+  })
+
+  it('reads correctly for a single skipped document', async () => {
+    H.fileGrep.mockResolvedValue({ ...GREP_PAYLOAD, skipped_docs: 1 })
+    mount()
+    await searchContents('needle')
+    // The count follows a label rather than inflecting a noun: "1 documents not
+    // searched" was the bug, and a colon form has no agreement to get wrong in
+    // any of the twelve catalogs.
+    await waitFor(() =>
+      expect(screen.getByTestId('file-grep-status').textContent)
+        .toContain('documents not searched: 1'))
+  })
+
+  it('reports an empty answer as no matches, not as an empty rail', async () => {
+    H.fileGrep.mockResolvedValue({ ...GREP_PAYLOAD, results: [] })
+    mount()
+    await searchContents('needle')
+    expect(await screen.findByText('No matches')).toBeInTheDocument()
+  })
+
+  it('says the search failed instead of showing zero results', async () => {
+    H.fileGrep.mockRejectedValue(Object.assign(new Error('nope'), { status: 403 }))
+    mount()
+    await searchContents('needle')
+    // A refused root and an empty tree are different facts, and the second is
+    // the one a user would act on by editing their query.
+    const notice = await screen.findByTestId('file-grep-error')
+    expect(notice).toHaveTextContent('Content search failed')
+    // Through ErrorNotice, not a hand-written red line: that is the one surface
+    // carrying the agent hand-off for an error the user cannot fix by retyping.
+    expect(notice).toHaveAttribute('role', 'alert')
+    expect(screen.getByTestId('file-grep-status')).not.toHaveTextContent('failed')
+  })
+
+  it('offers the agent hand-off on a failure, and no result rows', async () => {
+    H.fileGrep.mockRejectedValue(Object.assign(new Error('nope'), { status: 503 }))
+    mount()
+    await searchContents('needle')
+    await screen.findByTestId('file-grep-error')
+    // An exhausted probe pool is the agent's problem, not the user's, so the
+    // list stays empty rather than showing a stale hit set beside the error.
+    expect(screen.queryByText('src/a.ts')).toBeNull()
+    expect(screen.queryByText('No matches')).toBeNull()
   })
 })

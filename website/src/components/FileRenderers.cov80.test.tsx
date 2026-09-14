@@ -192,4 +192,30 @@ describe('PdfViewer', () => {
     expect(open).toHaveBeenCalledWith(url, '_blank')
     open.mockRestore()
   })
+
+  it('opens at a requested page through the #page fragment, but keeps the bare url for the new tab', () => {
+    const open = vi.spyOn(window, 'open').mockReturnValue(null)
+    render(<PdfViewer filePath="/zzq dir/a.pdf" page={3} />)
+
+    const url = '/api/file-raw?path=%2Fzzq%20dir%2Fa.pdf'
+    // `#page=N` is what Chromium's PDF viewer reads off the iframe URL -- the one
+    // document location a viewer here can honour, which is why a content-search
+    // hit inside a PDF can jump while one inside a deck cannot.
+    expect(
+      screen.getByTitle(i18nT('components.fileRenderers.pdf_preview')).getAttribute('src'),
+    ).toBe(`${url}#page=3`)
+    // "Open in new tab" is a read-the-document action, so it keeps the bare url.
+    fireEvent.click(
+      screen.getByRole('button', { name: i18nT('components.fileRenderers.open_in_new_tab') }),
+    )
+    expect(open).toHaveBeenCalledWith(url, '_blank')
+    open.mockRestore()
+  })
+
+  it('ignores a page that is not a positive number', () => {
+    render(<PdfViewer filePath="/zzq.pdf" page={0} />)
+    expect(
+      screen.getByTitle(i18nT('components.fileRenderers.pdf_preview')).getAttribute('src'),
+    ).toBe('/api/file-raw?path=%2Fzzq.pdf')
+  })
 })

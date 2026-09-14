@@ -1,9 +1,12 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
-import { Files, Diff, Search, X, RefreshCw } from 'lucide-react'
+import { Files, Diff, Search, X, RefreshCw, FileText } from 'lucide-react'
 import { api } from '../../api/client'
+import { fileGrep, type FileGrepHit } from '../../api/fileGrep'
 import ErrorNotice from '../../components/ErrorNotice'
+import { EmptyState } from '../../components/ui'
+import Clickable from '../../components/Clickable'
 import { cn } from '../../lib/utils'
 import { useColumnResize } from '../../hooks/useColumnResize'
 import { PierreWorkspaceTree } from '../../pierre/tree'
@@ -18,6 +21,25 @@ const RAIL_W_KEY = 'mc-files-rail-w'
  *  changes — and the mode must survive that, while a fresh page load still
  *  defaults to All files. */
 let sessionChangedMode = false
+
+/** Name/Content mode for the current page session, remembered exactly like
+ *  `sessionChangedMode` and for the same reason. Not persisted: content search
+ *  costs a walk of the project on every keystroke, so a page load starts on the
+ *  cheap filename filter and the user opts in. */
+let sessionSearchMode: SearchMode = 'name'
+
+/** Which search the field runs: filter the tree by FILE NAME, or grep file
+ *  CONTENTS (including inside PDF/Office documents) under the project root. */
+type SearchMode = 'name' | 'content'
+
+/** The backend's own floor — a shorter query returns nothing, so asking is a
+ *  wasted round trip. Mirrors `_GREP_MIN_QUERY_CHARS` in `handlers/files.py`. */
+const CONTENT_MIN_CHARS = 2
+
+/** Keystroke debounce before a content search leaves the browser. A filename
+ *  filter is local and instant; a content search is a bounded walk on the
+ *  gateway, so it waits for the typing to settle. */
+const CONTENT_DEBOUNCE_MS = 250
 
 /** Filter text for the current page session, keyed by project directory.
  *  Module-level like `sessionChangedMode` (and deliberately NOT localStorage:
@@ -72,18 +94,202 @@ export function useTreeAvailable(projectDir: string | null | undefined): boolean
   return useTreeState(projectDir) === 'ready'
 }
 
+/** `value`, delayed until it has stopped changing for `ms`. */
+function useDebounced<T>(value: T, ms: number): T {
+  const [settled, setSettled] = useState(value)
+  useEffect(() => {
+    const timer = setTimeout(() => setSettled(value), ms)
+    return () => clearTimeout(timer)
+  }, [value, ms])
+  return settled
+}
+
+/** A hit's path as the rail shows it: relative to the searched root, because the
+ *  absolute prefix is the same on every row and is what pushes the informative
+ *  tail out of a 300px rail. */
+function shortenPath(path: string, root: string): string {
+  if (root && path.startsWith(root)) return path.slice(root.length).replace(/^\//, '')
+  return path
+}
+
+/** The 1-based page a PDF hit points at, or null. The backend spells a PDF
+ *  location `p N`, and that is the ONE document location a viewer can honour:
+ *  Chromium's PDF viewer reads `#page=N` off the iframe URL. */
+const PDF_PAGE_LABEL = /^p (\d+)$/
+function pdfPageOf(hit: FileGrepHit): number | null {
+  const m = hit.label ? PDF_PAGE_LABEL.exec(hit.label) : null
+  return m ? Number(m[1]) : null
+}
+
+/**
+ * The preview line with the matched run marked. The search is
+ * case-insensitive, so the run is located on a folded copy and then sliced out
+ * of the ORIGINAL — highlighting the folded text would render the file's own
+ * casing wrong.
+ */
+function HighlightedPreview({ text, query }: { text: string; query: string }) {
+  const at = query ? text.toLowerCase().indexOf(query.toLowerCase()) : -1
+  if (at < 0) return <>{text}</>
+  return (
+    <>
+      {text.slice(0, at)}
+      <mark className="bg-accent/25 text-text rounded-[2px] px-[1px]">
+        {text.slice(at, at + query.length)}
+      </mark>
+      {text.slice(at + query.length)}
+    </>
+  )
+}
+
+/**
+ * The content-search results list, styled after the Files app's `SearchPanel`:
+ * one row per file, its root-relative path, `:line` for a text hit or the
+ * location badge for a document hit, and a one-line preview with the match
+ * marked.
+ */
+function ContentResults({ query, projectDir, onOpen }: {
+  query: string
+  projectDir: string
+  onOpen: (hit: FileGrepHit) => void
+}) {
+  const { t } = useTranslation()
+  const settled = useDebounced(query, CONTENT_DEBOUNCE_MS).trim()
+  const enabled = settled.length >= CONTENT_MIN_CHARS
+  const { data, isFetching, error } = useQuery({
+    queryKey: ['file-grep', projectDir, settled],
+    queryFn: () => fileGrep(projectDir, settled),
+    enabled: enabled && !!projectDir,
+    retry: false,
+    // The same query re-run on a re-mount is the same answer: the rail remounts
+    // on tab navigation, and re-walking the project for a query already on
+    // screen is the one cost this feature must not pay twice.
+    staleTime: 30_000,
+  })
+
+  if (!enabled) {
+    return (
+      <div className="px-2 py-3 text-[11.5px] text-muted">
+        {t('pages.chat.fileBrowserRail.content_hint')}
+      </div>
+    )
+  }
+
+  const results = data?.results ?? []
+  const notes: string[] = []
+  if (data) {
+    notes.push(t('components.discoverySearchBar.result', { count: results.length }))
+    if (data.truncated) notes.push(t('pages.chat.fileBrowserRail.content_capped'))
+    if (data.skipped_docs > 0) {
+      notes.push(t('pages.chat.fileBrowserRail.content_docs_skipped', { count: data.skipped_docs }))
+    }
+  }
+  // The engine name is diagnostic, not a result, and reading it as one is
+  // actively misleading: "python" was taken to mean the search had been narrowed
+  // to Python FILES, i.e. that the list was incomplete on purpose. It moves to
+  // the row's tooltip, where the same string answers "why is this slow" without
+  // being mistaken for a filter. The tooltip also says what a capped answer
+  // means, because "capped" alone reads as a notice the user might be able to
+  // click.
+  const why = data?.engine
+    ? t('pages.chat.fileBrowserRail.content_engine', { engine: data.engine })
+    : undefined
+
+  return (
+    <div className="flex flex-col min-h-0 flex-1">
+      {/* A search that FAILED is an error surfaced to the user, so it renders
+          through ErrorNotice rather than as a red line in the status row: that
+          is the one component that recovers the route, endpoint, HTTP status and
+          backend code from the error journal and offers them to the agent. A
+          refused root or an exhausted probe pool is not something the user can
+          fix by retyping. Hand-off on -- a read failure has nothing to lose. */}
+      {error && (
+        <div className="px-2 pb-1.5 shrink-0">
+          <ErrorNotice
+            variant="inline"
+            className="whitespace-normal"
+            message={t('pages.chat.fileBrowserRail.content_failed')}
+            askAgent
+            testId="file-grep-error"
+          />
+        </div>
+      )}
+      <div
+        className="px-2 pb-1 text-[10.5px] text-muted shrink-0"
+        data-testid="file-grep-status"
+        title={why || undefined}
+      >
+        {isFetching ? t('pages.chat.fileBrowserRail.content_searching') : notes.join(' · ')}
+      </div>
+      {data?.truncated && (
+        <div className="px-2 pb-1 text-[10.5px] text-muted shrink-0" data-testid="file-grep-partial-why">
+          {t('pages.chat.fileBrowserRail.content_partial_why')}
+        </div>
+      )}
+      {/* A `slide 7` or `Sheet1 r12` badge reads as a jump target, and for
+          those formats the click cannot honour it -- the office viewer is an
+          extracted-text preview with no slide or row to scroll to. Said once,
+          visibly, above the list, rather than per row or only on hover. A PDF
+          badge is NOT in this class: its click opens the page. */}
+      {results.some(h => h.label && pdfPageOf(h) === null) && (
+        <div className="px-2 pb-1 text-[10.5px] text-muted shrink-0" data-testid="file-grep-doc-note">
+          {t('pages.chat.fileBrowserRail.content_doc_note')}
+        </div>
+      )}
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        {!isFetching && !error && results.length === 0 ? (
+          <EmptyState icon={<Search size={20} />} title={t('pages.chat.fileBrowserRail.content_no_matches')} />
+        ) : (
+          results.map((hit, index) => (
+            <Clickable
+              key={`${hit.file}:${hit.line}:${hit.label ?? ''}:${index}`}
+              className="block w-full text-left px-2 py-1 rounded-md hover:bg-bg-hover cursor-pointer"
+              onClick={() => onOpen(hit)}
+            >
+              <div className="flex items-center gap-1 text-[11.5px] text-text truncate">
+                <FileText size={11} className="shrink-0 opacity-60" />
+                <span className="truncate">{shortenPath(hit.file, data?.root ?? projectDir)}</span>
+                {/* A document has no line to jump to, so the row names the place
+                    inside itself instead — "p 3", "slide 7", "Sheet1 r12". A PDF
+                    page is honoured by the click; the others are explained by
+                    the note above the list. */}
+                <span
+                  className="shrink-0 text-muted tabular-nums"
+                  title={hit.label && pdfPageOf(hit) === null
+                    ? t('pages.chat.fileBrowserRail.content_doc_location', { at: hit.label })
+                    : undefined}
+                >
+                  {hit.label ? hit.label : `:${hit.line}`}
+                </span>
+              </div>
+              <div className="text-[11px] text-muted truncate pl-[16px]">
+                <HighlightedPreview text={hit.preview} query={settled} />
+              </div>
+            </Clickable>
+          ))
+        )}
+      </div>
+    </div>
+  )
+}
+
 /**
  * The file-browser rail: resize grip + tree column, headed by ONE row — an
  * icons-only All/Changed segment (tooltips carry the labels, Changed shows a
- * live count) with an always-open search field filling the rest. The query
- * feeds the tree's search session (the tree's own built-in bar is disabled).
+ * live count) with an always-open search field filling the rest — and a
+ * Name/Content toggle in words on the row beneath it.
  *
- * Both modes render the SAME Pierre tree; Changed feeds it the git-status
+ * Name mode feeds the tree's search session (the tree's own built-in bar is
+ * disabled). Content mode replaces the tree with grep results from
+ * `/api/file-grep`, which searches file CONTENTS under the project root —
+ * including the text inside PDF, Word, PowerPoint and Excel documents.
+ *
+ * Both tree modes render the SAME Pierre tree; Changed feeds it the git-status
  * path set and its opens land in diff mode (`onFileOpen`'s second argument).
  */
 export default function FileBrowserRail({ projectDir, onFileOpen, onAddToContext, selectedPath }: {
   projectDir: string
-  onFileOpen: (absPath: string, diff: boolean) => void
+  /** `opts.line` opens the file scrolled to that line — a content-search hit. */
+  onFileOpen: (absPath: string, diff: boolean, opts?: { line?: number }) => void
   /** Right-click "Add to context" on a tree row: forwards the ABSOLUTE path
    *  and whether it is a file or a directory up to the composer host. */
   onAddToContext?: (absPath: string, kind: 'file' | 'dir') => void
@@ -95,6 +301,11 @@ export default function FileBrowserRail({ projectDir, onFileOpen, onAddToContext
   const setChangedMode = (v: boolean) => {
     sessionChangedMode = v
     _setChangedMode(v)
+  }
+  const [searchMode, _setSearchMode] = useState<SearchMode>(() => sessionSearchMode)
+  const setSearchMode = (v: SearchMode) => {
+    sessionSearchMode = v
+    _setSearchMode(v)
   }
   const [query, _setQuery] = useState(() => sessionQuery.get(projectDir) ?? '')
   // Rehydrate on an in-place projectDir change (React's adjust-state-on-prop
@@ -132,6 +343,9 @@ export default function FileBrowserRail({ projectDir, onFileOpen, onAddToContext
       await Promise.all([
         qc.refetchQueries({ queryKey: ['project-tree', projectDir] }),
         qc.refetchQueries({ queryKey: ['git-status', projectDir] }),
+        // Content results are cached for 30s, so the escape hatch has to reach
+        // them too or a refresh would leave a stale hit list beside a fresh tree.
+        qc.refetchQueries({ queryKey: ['file-grep', projectDir] }),
       ])
     } finally {
       setRefreshing(false)
@@ -157,6 +371,8 @@ export default function FileBrowserRail({ projectDir, onFileOpen, onAddToContext
   const segBtn = (on: boolean) =>
     cn('flex items-center justify-center gap-1.5 h-[22px] px-2 rounded-[5px] text-[11.5px] font-medium cursor-pointer border-none transition-colors',
        on ? 'bg-bg text-text shadow-[0_0_0_1px_var(--border)]' : 'bg-transparent text-muted hover:text-text')
+
+  const contentMode = searchMode === 'content'
 
   return (
     <>
@@ -201,8 +417,12 @@ export default function FileBrowserRail({ projectDir, onFileOpen, onAddToContext
               value={query}
               onChange={e => setQuery(e.target.value)}
               onKeyDown={e => { if (e.key === 'Escape') setQuery('') }}
-              placeholder={t('pages.chat.fileBrowserRail.filter_placeholder')}
-              aria-label={t('pages.chat.fileBrowserRail.filter_placeholder')}
+              placeholder={contentMode
+                ? t('pages.chat.fileBrowserRail.content_placeholder')
+                : t('pages.chat.fileBrowserRail.filter_placeholder')}
+              aria-label={contentMode
+                ? t('pages.chat.fileBrowserRail.content_placeholder')
+                : t('pages.chat.fileBrowserRail.filter_placeholder')}
               className="flex-1 min-w-0 bg-transparent border-none outline-none text-[12px] text-text"
             />
             {query && (
@@ -225,6 +445,40 @@ export default function FileBrowserRail({ projectDir, onFileOpen, onAddToContext
             <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} />
           </button>
         </div>
+        {/* The Name/Content toggle has its own row, in words, both always
+            showing. It was an icon pair inside the search field first, then an
+            icon pair with the active word: readers still misread the inactive
+            icon, and the pair ate the field's width until ~8 characters of the
+            user's own query stayed visible. Two plain words on their own row
+            cost 26px of height and remove both problems. The cost of a wrong
+            read here is silent -- the same query becomes a different search --
+            which is why this control gets words where All/Changed gets icons. */}
+        <div className="flex items-center px-2 pt-1.5 shrink-0">
+          <div
+            className="flex w-full bg-bg-elevated border border-border rounded-[7px] p-[2px] gap-[2px]"
+            role="group"
+            aria-label={t('pages.chat.fileBrowserRail.search_mode')}
+          >
+            <button
+              onClick={() => setSearchMode('name')}
+              aria-pressed={!contentMode}
+              className={cn(segBtn(!contentMode), 'flex-1')}
+              title={t('pages.chat.fileBrowserRail.search_names')}
+              aria-label={t('pages.chat.fileBrowserRail.search_names')}
+            >
+              {t('pages.chat.fileBrowserRail.mode_name')}
+            </button>
+            <button
+              onClick={() => setSearchMode('content')}
+              aria-pressed={contentMode}
+              className={cn(segBtn(contentMode), 'flex-1')}
+              title={t('pages.chat.fileBrowserRail.search_contents')}
+              aria-label={t('pages.chat.fileBrowserRail.search_contents')}
+            >
+              {t('pages.chat.fileBrowserRail.mode_content')}
+            </button>
+          </div>
+        </div>
         {/* A failed status read used to make the Changed count silently read 0.
             Its own row under the header (the 40px header is full). File rail,
             no draft → hand-off on. */}
@@ -234,15 +488,33 @@ export default function FileBrowserRail({ projectDir, onFileOpen, onAddToContext
           </div>
         )}
         <div className="flex-1 min-h-0 flex flex-col py-1.5 pl-1">
-          <PierreWorkspaceTree
-            mode={changedMode ? 'changed' : 'all'}
-            projectDir={projectDir}
-            persistExpansion
-            onFileOpen={(abs) => onFileOpen(abs, changedMode)}
-            onAddToContext={onAddToContext}
-            searchQuery={query || null}
-            selectedPath={selectedPath ?? null}
-          />
+          {contentMode ? (
+            <ContentResults
+              query={query}
+              projectDir={projectDir}
+              // A text hit carries the line it matched on. A PDF hit carries
+              // its PAGE in the same slot: `revealLine` is the one reveal channel
+              // the panel has, and for a PDF tab the viewer reads it as a page.
+              // Any other document hit has no navigable position (line 0), and
+              // passing 0 would ask for a line that does not exist, so the file
+              // simply opens.
+              onOpen={hit => {
+                const page = pdfPageOf(hit)
+                const line = page ?? (hit.line > 0 ? hit.line : undefined)
+                onFileOpen(hit.file, false, line !== undefined ? { line } : undefined)
+              }}
+            />
+          ) : (
+            <PierreWorkspaceTree
+              mode={changedMode ? 'changed' : 'all'}
+              projectDir={projectDir}
+              persistExpansion
+              onFileOpen={(abs) => onFileOpen(abs, changedMode)}
+              onAddToContext={onAddToContext}
+              searchQuery={query || null}
+              selectedPath={selectedPath ?? null}
+            />
+          )}
         </div>
       </div>
     </>

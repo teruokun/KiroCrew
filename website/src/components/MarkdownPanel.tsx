@@ -986,6 +986,11 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // viewer and drops the line: strictly better than the inert chip it used to be,
   // and it strands nothing.
   const revealTargetsSource = !RICH_FILE_TYPES.includes(detectFileType(filePath))
+  // A PDF has no source line, so for a pdf tab the reveal target's `line` is a
+  // PAGE: the one location its viewer can open at (`#page=N`). Every other rich
+  // type still ignores the target -- a deck or workbook preview has nowhere to
+  // scroll to -- and the jump effects below stay gated on revealTargetsSource.
+  const pdfRevealPage = detectFileType(filePath) === 'pdf' && revealLine && revealLine.line > 0 ? revealLine.line : undefined
   // Markdown (and other preview-capable types) opens in its viewer; everything
   // else editable opens straight in the Pierre editor — there is no separate
   // read-only source mode for code files.
@@ -2101,7 +2106,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
             {!zeroDiff && !diffUnavailable && !diffChecking && !isRichType && (
               <DiffViewBlock flush sideBySide={diffSplit} diffMode={diffMode && !editing} fileName={fileName} originalContent={originalContent} content={content} lineNums={lineNums} wordWrap={wordWrap} collapseUnchanged={collapseUnchanged} />
             )}
-            {!zeroDiff && (!diffUnavailable || editing) && (!diffMode || editing) && <ContentRenderer flush isRichType={isRichType} fileType={fileType} filePath={filePath} content={content} editing={editing} lang={lang} lineNums={lineNums} wordWrap={wordWrap} onChange={handleChange} onSave={handleSave}
+            {!zeroDiff && (!diffUnavailable || editing) && (!diffMode || editing) && <ContentRenderer flush isRichType={isRichType} fileType={fileType} filePath={filePath} pdfPage={pdfRevealPage} content={content} editing={editing} lang={lang} lineNums={lineNums} wordWrap={wordWrap} onChange={handleChange} onSave={handleSave}
               diffBase={diffMode && editing ? (originalContent || null) : undefined} diffSplit={diffSplit} diffExpandUnchanged={!collapseUnchanged}
               previewRef={previewRef} displayContent={displayContent} isMarkdown={isMarkdown} markdownClassName="msg-content text-sm leading-relaxed" editorRef={setRevealEditor} />}
           </div>
@@ -2178,7 +2183,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
             {zeroDiff && <ZeroDiffNotice onExitDiff={toggleDiffMode} />}
             {diffUnavailableText && !editing && <ZeroDiffNotice message={diffUnavailableText} onExitDiff={toggleDiffMode} />}
             {!zeroDiff && !diffUnavailable && !isRichType && <DiffViewBlock sideBySide={diffSplit} diffMode={diffMode && !editing} fileName={fileName} originalContent={originalContent} content={content} lineNums={lineNums} wordWrap={wordWrap} collapseUnchanged={collapseUnchanged} />}
-            {!zeroDiff && (!diffUnavailable || editing) && (!diffMode || editing) && <ContentRenderer isRichType={isRichType} fileType={fileType} filePath={filePath} content={content} editing={editing} lang={lang} lineNums={lineNums} wordWrap={wordWrap} onChange={handleChange} onSave={handleSave}
+            {!zeroDiff && (!diffUnavailable || editing) && (!diffMode || editing) && <ContentRenderer isRichType={isRichType} fileType={fileType} filePath={filePath} pdfPage={pdfRevealPage} content={content} editing={editing} lang={lang} lineNums={lineNums} wordWrap={wordWrap} onChange={handleChange} onSave={handleSave}
               diffBase={diffMode && editing ? (originalContent || null) : undefined} diffSplit={diffSplit} diffExpandUnchanged={!collapseUnchanged}
               previewRef={fullscreenPreviewRef} displayContent={displayContent} isMarkdown={isMarkdown} previewStyle={mdPreviewStyle} editorRef={setRevealEditor} />}
           </div>

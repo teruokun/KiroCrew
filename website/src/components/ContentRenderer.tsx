@@ -61,11 +61,15 @@ export const ContentRenderer = memo(function ContentRenderer({
   lang, lineNums, wordWrap, onChange, onSave,
   previewRef, displayContent, isMarkdown,
   markdownClassName, previewStyle, flush, editorRef, diffBase, diffSplit, diffExpandUnchanged,
+  pdfPage,
 }: {
   isRichType: boolean
   fileType: string
   /** Required for `image` / `pdf` (URL construction). Optional otherwise. */
   filePath?: string
+  /** 1-based page the PDF viewer opens at — a content-search hit's location.
+   *  Only the `pdf` branch reads it. */
+  pdfPage?: number
   content: string
   editing: boolean
   lang: string
@@ -165,7 +169,7 @@ export const ContentRenderer = memo(function ContentRenderer({
       {isRichType && fileType === 'json' && <JsonViewer content={content} />}
       {isRichType && fileType === 'jsonl' && <JsonlViewer content={content} />}
       {isRichType && fileType === 'html' && <HtmlViewer content={content} />}
-      {isRichType && fileType === 'pdf' && filePath && <PdfViewer filePath={filePath} />}
+      {isRichType && fileType === 'pdf' && filePath && <PdfViewer filePath={filePath} page={pdfPage} />}
       {isRichType && fileType === 'sheet' && filePath && <SheetViewer filePath={filePath} />}
       {isRichType && fileType === 'office' && filePath && <OfficeViewer filePath={filePath} />}
       {isRichType && fileType === 'video' && filePath && <MediaPlayer filePath={filePath} kind="video" />}

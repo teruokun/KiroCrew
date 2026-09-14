@@ -290,12 +290,18 @@ export const HtmlViewer = memo(function HtmlViewer({ content }: { content: strin
 })
 
 /* ── PDF viewer (embedded + fallback open externally) ── */
-export const PdfViewer = memo(function PdfViewer({ filePath }: { filePath: string }) {
+export const PdfViewer = memo(function PdfViewer({ filePath, page }: { filePath: string; page?: number }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const url = '/api/file-raw?path=' + encodeURIComponent(filePath)
+  // `#page=N` is the open-parameter Chromium's built-in PDF viewer reads off the
+  // iframe URL, and the ONLY document location a viewer here can honour -- which
+  // is why a content-search hit inside a PDF can jump and one inside a deck
+  // cannot. The fragment is on the iframe src alone; the open-in-new-tab button
+  // below keeps the bare URL, since that is a "read the document" action.
+  const src = page && page > 0 ? `${url}#page=${page}` : url
   return (
     <div className="h-full border border-border rounded-md overflow-hidden bg-white flex flex-col">
-      <iframe src={url} className="flex-1 w-full border-none" title={i18nT('components.fileRenderers.pdf_preview')} />
+      <iframe src={src} className="flex-1 w-full border-none" title={i18nT('components.fileRenderers.pdf_preview')} />
       <div className="flex justify-end p-1 bg-chrome border-t border-border">
         <button
           className="px-2 py-1 rounded text-[11px] text-muted hover:text-text cursor-pointer bg-transparent border-none"

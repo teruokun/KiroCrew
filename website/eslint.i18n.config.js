@@ -375,12 +375,15 @@ export default [
               // above; the literals that reach the linter here are `?id=`, `?since=`
               // and `&v=`.
               //
-              // The leading character is `[?&]`, not `?` alone: a CONTINUATION
+              // The leading character is `[?&#]`, not `?` alone: a CONTINUATION
               // parameter is exactly the same server contract as the first one, and a
-              // URL carrying two parameters has to spell one of them with `&`. The
-              // shape stays just as tight — prose takes neither a leading `?`/`&` nor
-              // a trailing `=`, so this still reports real copy.
-              String.raw`^[?&][a-z_]+=$`,
+              // URL carrying two parameters has to spell one of them with `&`. `#` is
+              // the fragment form of the same thing — `#page=` is the open parameter
+              // Chromium's PDF viewer reads off an iframe URL, a viewer contract rather
+              // than a server one, and translating it would open page 1 every time.
+              // The shape stays just as tight — prose takes neither a leading
+              // `?`/`&`/`#` nor a trailing `=`, so this still reports real copy.
+              String.raw`^[?&#][a-z_]+=$`,
 
               // The same server contract with a FIXED flag value baked in, e.g.
               // `&resolve=1`. The value class is a single digit or lowercase word
