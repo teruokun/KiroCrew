@@ -8285,6 +8285,8 @@
       "empty_state": "Aucune modification ni commit à afficher.",
       "just_now": "à l'instant",
       "loading": "chargement...",
+      "not_a_repository": "Ce n’est pas un dépôt Git",
+      "not_a_repository_help": "Ce dossier de projet n’est pas un arbre de travail Git. Si le dépôt se trouve dans un sous-dossier, définissez ce dossier comme projet de la session.",
       "no_project": "Aucun dossier de projet défini pour cette session.",
       "refresh": "Actualiser",
       "title": "Git",

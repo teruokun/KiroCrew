@@ -26,7 +26,7 @@ import uuid
 import zipfile
 from dataclasses import asdict
 from pathlib import Path
-from typing import BinaryIO, Callable, NamedTuple, TypeVar
+from typing import BinaryIO, Callable, Literal, NamedTuple, TypeVar
 
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
@@ -4450,6 +4450,36 @@ _GIT_ROOT_WALK_LIMIT = 40
 #: enormous cannot be slurped into memory.
 _HEAD_READ_LIMIT = 4096
 
+_PathKind = Literal["absent", "directory", "file", "symlink", "other"]
+_WINDOWS_REPARSE_POINT = getattr(_stat_mod, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+_WINDOWS_LINKED_ANCESTOR_GUARD = sys.platform == "win32"
+
+
+def _path_kind(path: str, *, follow_symlinks: bool = False) -> _PathKind | None:
+    """Classify *path* without collapsing access errors into absence."""
+    try:
+        info = (os.stat if follow_symlinks else os.lstat)(path)
+    except ValueError:
+        return "absent"
+    except OSError as exc:
+        if (
+            isinstance(exc, (FileNotFoundError, NotADirectoryError))
+            or exc.errno in (errno.ENOENT, errno.ENOTDIR)
+            or getattr(exc, "winerror", None) in (2, 3, 267)
+        ):
+            return "absent"
+        return None
+    if not follow_symlinks and (getattr(info, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT):
+        return "symlink"
+    mode = info.st_mode
+    if _stat_mod.S_ISDIR(mode):
+        return "directory"
+    if _stat_mod.S_ISREG(mode):
+        return "file"
+    if _stat_mod.S_ISLNK(mode):
+        return "symlink"
+    return "other"
+
 
 def _read_git_meta_prefix(path: str) -> str | None:
     """Read a bounded prefix of a git metadata file through the hooks gate.
@@ -4466,7 +4496,44 @@ def _read_git_meta_prefix(path: str) -> str | None:
     data = safe_read_prefix(path, _HEAD_READ_LIMIT)
     if data is None:
         return None
-    return data.decode("utf-8", errors="replace").strip()
+    return data.decode("utf-8", errors="replace").rstrip("\r\n")
+
+
+def _validated_git_symbolic_ref(raw: str) -> str | None:
+    """Return a conservative ``refs/`` target from a symbolic HEAD line."""
+    prefix = "ref: "
+    if not raw.startswith(prefix):
+        return None
+    ref = raw[len(prefix) :]
+    tail = ref[len("refs/") :] if ref.startswith("refs/") else ""
+    if (
+        not tail
+        or tail.startswith("/")
+        or tail.endswith("/")
+        or ".." in ref
+        or "//" in ref
+        or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in ref)
+    ):
+        return None
+    return ref
+
+
+def _gitdir_target_is_refused(path: str) -> bool:
+    """Reject malformed, UNC, and Windows-device gitdir targets lexically."""
+    if "\x00" in path:
+        return True
+    if len(path) >= 2 and path[0] in "/\\" and path[1] in "/\\":
+        return True
+    normalized = path.replace("/", "\\")
+    drive, _ = ntpath.splitdrive(normalized)
+    return drive.startswith("\\\\")
+
+
+def _git_metadata_path_has_linked_ancestor(path: str) -> bool:
+    """Whether a Windows metadata probe would cross a linked parent."""
+    return (
+        _WINDOWS_LINKED_ANCESTOR_GUARD and platform_compat.first_linked_ancestor(path) is not None
+    )
 
 
 def _git_head_path(root: str) -> str | None:
@@ -4483,7 +4550,7 @@ def _git_head_path(root: str) -> str | None:
     if pointer is None or not pointer.startswith("gitdir:"):
         return None
     gitdir = pointer.split(":", 1)[1].strip()
-    if not gitdir:
+    if not gitdir or _gitdir_target_is_refused(gitdir):
         return None
     if not os.path.isabs(gitdir):
         gitdir = os.path.join(root, gitdir)
@@ -4576,8 +4643,8 @@ def _project_git_branch(base: str) -> dict:
         # Unreadable, absent, or refused by the sensitive-path gate: still a
         # repo, just no label.
         return out
-    if raw.startswith("ref:"):
-        ref = raw[len("ref:"):].strip()
+    ref = _validated_git_symbolic_ref(raw)
+    if ref is not None:
         prefix = "refs/heads/"
         if ref.startswith(prefix) and len(ref) > len(prefix):
             # Branch names are attacker/agent-controllable content that this route
@@ -4586,6 +4653,8 @@ def _project_git_branch(base: str) -> dict:
             # branch names are unchanged; one that embeds something matching a
             # credential pattern is masked rather than displayed.
             out["branch"] = redact(ref[len(prefix):])
+        return out
+    if raw.startswith("ref:"):
         return out
     # A bare object id in HEAD means detached (mid-rebase, bisect, explicit
     # --detach). Surface a short form so the caller shows something truthful
@@ -4596,6 +4665,73 @@ def _project_git_branch(base: str) -> dict:
         out["detached"] = True
         out["head"] = redact(raw[:7])
     return out
+
+
+def _project_git_marker_state(base: str) -> bool | None:
+    """Classify repository markers below *base* without launching Git.
+
+    ``True`` means the marker has a structurally valid HEAD, ``False`` means no
+    repository marker or a malformed stray ``.git`` entry, and ``None`` means a
+    marker exists but its metadata cannot be read safely. The unknown state must
+    not be relabelled as absence when the later Git probe also fails.
+    """
+    root: str | None = None
+    marker_kind: _PathKind | None = None
+    cur = base
+    for _ in range(_GIT_ROOT_WALK_LIMIT):
+        marker_kind = _path_kind(os.path.join(cur, ".git"))
+        if marker_kind is None:
+            return None
+        if marker_kind != "absent":
+            root = cur
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    if root is None:
+        return False
+
+    dot = os.path.join(root, ".git")
+    if marker_kind == "directory":
+        # A real repository has an object store. Requiring it keeps an empty or
+        # incidental .git directory from turning Git's rejection into a 503.
+        objects_kind = _path_kind(os.path.join(dot, "objects"))
+        if objects_kind in (None, "symlink"):
+            return None
+        if objects_kind != "directory":
+            return False
+        head_path = os.path.join(dot, "HEAD")
+    elif marker_kind == "file":
+        pointer = _read_git_meta_prefix(dot)
+        if pointer is None:
+            return None
+        if not pointer.startswith("gitdir:"):
+            return False
+        gitdir = pointer.split(":", 1)[1].strip()
+        if not gitdir or _gitdir_target_is_refused(gitdir):
+            return False
+        if not os.path.isabs(gitdir):
+            gitdir = os.path.join(root, gitdir)
+        head_path = os.path.join(gitdir, "HEAD")
+    else:
+        # A symlink marker is never followed: its target's existence or type
+        # must not affect this endpoint's answer.
+        return False
+
+    if _git_metadata_path_has_linked_ancestor(head_path):
+        return None
+    head_kind = _path_kind(head_path)
+    if head_kind is None:
+        return None
+    if head_kind != "file":
+        return False
+    raw = _read_git_meta_prefix(head_path)
+    if raw is None:
+        return None
+    if raw.startswith("ref:"):
+        return _validated_git_symbolic_ref(raw) is not None
+    return re.fullmatch(r"[0-9a-fA-F]{40,64}", raw) is not None
 
 
 def _match_known_project_for(slot_projects: list[str], raw: str) -> str | None:
@@ -5646,8 +5782,21 @@ async def api_file_sheet(request: web.Request) -> web.Response:
 _GIT_PANEL_STDOUT_CAP = 8 * 1024 * 1024
 
 
+def _project_directory_absent(path: str) -> bool:
+    """Return whether *path* is missing or is not a directory.
+
+    ``subprocess`` and ``stat`` expose a vanished cwd differently across
+    platforms: POSIX reports ENOENT/ENOTDIR while Windows may report errors 2,
+    3, or 267. Other filesystem errors are not evidence of absence.
+    """
+    return _path_kind(path, follow_symlinks=True) in ("absent", "file", "symlink", "other")
+
+
 def _run_git_bounded(
-    args: list[str], cwd: str, env: dict, timeout: float,
+    args: list[str],
+    cwd: str,
+    env: dict,
+    timeout: float,
     cap: int = _GIT_PANEL_STDOUT_CAP,
 ) -> tuple[int, str, bool]:
     """Run git capturing at most ``cap`` bytes of stdout.
@@ -5844,6 +5993,13 @@ async def api_project_git_status(request: web.Request) -> web.Response:
     if not await asyncio.to_thread(os.path.isdir, base):
         return web.json_response({"repo": False, "files": []})
 
+    # Confirm repository presence from metadata before spawning Git. A malformed
+    # stray .git entry is confirmed absence; unreadable metadata stays unknown
+    # so a later process failure cannot be mislabeled as not-a-repository.
+    marker_state = await asyncio.to_thread(_project_git_marker_state, base)
+    if marker_state is False:
+        return web.json_response({"repo": False, "files": []})
+
     def _run() -> dict:
         _git_cmd = [
             "git",
@@ -5859,12 +6015,15 @@ async def api_project_git_status(request: web.Request) -> web.Response:
         ]
         _env = {**os.environ, "GIT_ATTR_NOSYSTEM": "1"}
 
-        # Check if it's a repo
+        # The metadata gate above already ruled out confirmed absence. A failed
+        # sandboxed Git probe is therefore unavailable (sandbox, executable,
+        # timeout, unreadable metadata, or a concurrent removal); the response
+        # classifier below rechecks the directory before returning 503.
         probe_rc, _probe_out, _ = _run_git_bounded(
             [*_git_cmd, "rev-parse", "--git-dir"], cwd=base, env=_env, timeout=5,
         )
         if probe_rc != 0:
-            return {"repo": False, "files": []}
+            return {"_status_unavailable": True}
 
         # Refuse repos whose own config names a content-filter driver: status
         # re-hashes modified files through ``filter.<name>.clean``, which would
@@ -5884,7 +6043,7 @@ async def api_project_git_status(request: web.Request) -> web.Response:
             cwd=base, env=_env, timeout=10,
         )
         if status_rc != 0:
-            return {"repo": True, "repoRoot": repo_root, "files": []}
+            return {"_status_unavailable": True}
 
         lines = status_out.splitlines()
         branch = None
@@ -6000,6 +6159,22 @@ async def api_project_git_status(request: web.Request) -> web.Response:
         return result
 
     result = await asyncio.to_thread(_run)
+    # A project directory can vanish after the metadata check and surface from
+    # process creation as ENOENT/ENOTDIR (FileNotFoundError or
+    # NotADirectoryError), including Windows errors 2, 3, and 267. Re-check the
+    # authoritative path once here so every spawn/status stage has the same
+    # classification: absence is a normal no-repository result; only a failure
+    # while the directory still exists is an operational outage.
+    if await asyncio.to_thread(_project_directory_absent, base):
+        return web.json_response({"repo": False, "files": []})
+    if result.pop("_status_unavailable", False):
+        return web.json_response(
+            {
+                "error": "Couldn't read the repository status.",
+                "code": "git_status_unavailable",
+            },
+            status=503,
+        )
     # Egress redaction: repo content (paths, branch label, repo root) is
     # agent-influenceable and this response body is rendered by the dashboard,
     # so it goes through the same redaction as api_project_git. Normal values

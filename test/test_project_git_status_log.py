@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import subprocess
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -114,6 +116,146 @@ class TestGitStatus:
             data = await resp.json()
         assert data["repo"] is False
         assert data["files"] == []
+
+    @pytest.mark.parametrize("marker_kind", ("empty_dir", "garbage_file"))
+    @pytest.mark.asyncio
+    async def test_stray_git_marker_returns_repo_false(self, tmp_path, mock_sel, marker_kind):
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        marker = plain / ".git"
+        if marker_kind == "empty_dir":
+            marker.mkdir()
+        else:
+            marker.write_text("not a gitdir pointer\n")
+
+        async with TestClient(TestServer(_make_app(str(plain)))) as client:
+            resp = await client.get(f"/api/project/git/status?path={plain}")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {"repo": False, "files": []}
+
+    @pytest.mark.asyncio
+    async def test_unreadable_marker_metadata_falls_through_to_git(
+        self, repo, mock_sel, monkeypatch
+    ):
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        real_stat = files_mod.os.stat
+        objects_path = os.path.normcase(os.fspath(repo / ".git" / "objects"))
+
+        def deny_objects(path, *args, **kwargs):
+            if os.path.normcase(os.fspath(path)) == objects_path:
+                raise PermissionError(errno.EACCES, "access denied", os.fspath(path))
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(files_mod.os, "stat", deny_objects)
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/status?path={repo}")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["repo"] is True
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+    @pytest.mark.asyncio
+    async def test_symlink_git_markers_do_not_probe_their_targets(
+        self, repo, tmp_path, mock_sel, monkeypatch
+    ):
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        existing = tmp_path / "existing"
+        missing = tmp_path / "missing"
+        existing.mkdir()
+        missing.mkdir()
+        (existing / ".git").symlink_to(repo / ".git", target_is_directory=True)
+        (missing / ".git").symlink_to(tmp_path / "absent-target", target_is_directory=True)
+        read_meta = MagicMock(side_effect=AssertionError("symlink target was read"))
+        monkeypatch.setattr(files_mod, "_read_git_meta_prefix", read_meta)
+
+        results = []
+        async with TestClient(TestServer(_make_app(str(existing), str(missing)))) as client:
+            for project in (existing, missing):
+                resp = await client.get(f"/api/project/git/status?path={project}")
+                body = await resp.json() if resp.status == 200 else None
+                results.append((resp.status, body))
+
+        expected = (200, {"repo": False, "files": []})
+        assert results == [expected, expected]
+        read_meta.assert_not_called()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+    @pytest.mark.asyncio
+    async def test_symlinked_object_store_falls_through_to_git(self, repo, tmp_path, mock_sel):
+        relocated = tmp_path / "objects"
+        shutil.move(repo / ".git" / "objects", relocated)
+        (repo / ".git" / "objects").symlink_to(relocated, target_is_directory=True)
+
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/status?path={repo}")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["repo"] is True
+
+    @pytest.mark.parametrize(
+        "head",
+        (
+            "ref: refs/heads/bad name\n",
+            "ref: refs/heads/main..lock\n",
+            "ref: refs/heads/main/\n",
+            "ref: refs/heads/bad\x01name\n",
+        ),
+    )
+    @pytest.mark.asyncio
+    async def test_malformed_symbolic_ref_returns_repo_false(self, repo, mock_sel, head):
+        (repo / ".git" / "HEAD").write_text(head)
+
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/status?path={repo}")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {"repo": False, "files": []}
+
+    @pytest.mark.parametrize("failure", ("sandbox", "spawn", "status"))
+    @pytest.mark.asyncio
+    async def test_operational_status_failure_is_not_reported_as_non_repo(
+        self, repo, mock_sel, monkeypatch, failure
+    ):
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        if failure == "sandbox":
+
+            def refuse(*_args, **_kwargs):
+                raise RuntimeError("sandbox unavailable")
+
+            monkeypatch.setattr(files_mod, "sandboxed_spawn_argv", refuse)
+        elif failure == "spawn":
+            monkeypatch.setattr(
+                files_mod,
+                "popen_limited",
+                MagicMock(side_effect=OSError("git unavailable")),
+            )
+        else:
+            real_popen = files_mod.popen_limited
+
+            def fail_status(argv, *args, **kwargs):
+                if "status" in argv:
+                    raise OSError("git status unavailable")
+                return real_popen(argv, *args, **kwargs)
+
+            monkeypatch.setattr(files_mod, "popen_limited", fail_status)
+
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/status?path={repo}")
+            data = await resp.json()
+
+        assert resp.status == 503
+        assert data == {
+            "error": "Couldn't read the repository status.",
+            "code": "git_status_unavailable",
+        }
 
     @pytest.mark.asyncio
     async def test_unknown_dir_is_refused(self, repo, tmp_path, mock_sel):
@@ -483,6 +625,29 @@ class TestArrowFilename:
 
 
 class TestVanishedDirectory:
+    @pytest.mark.asyncio
+    async def test_windows_spawn_failure_after_directory_vanishes_returns_no_data(
+        self, repo, mock_sel, monkeypatch
+    ):
+        """A Windows spawn error for a vanished cwd is absence, not outage."""
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        def vanish_then_fail(*_args, **_kwargs):
+            shutil.rmtree(repo, ignore_errors=True)
+            error = FileNotFoundError(
+                2, "[WinError 3] The system cannot find the path specified", str(repo)
+            )
+            error.winerror = 3
+            raise error
+
+        monkeypatch.setattr(files_mod, "popen_limited", vanish_then_fail)
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/status?path={repo}")
+            assert resp.status == 200
+            data = await resp.json()
+        assert data["repo"] is False
+        assert data["files"] == []
+
     @pytest.mark.asyncio
     async def test_dir_removed_between_check_and_spawn_returns_no_data(self, repo, mock_sel, monkeypatch):
         """TOCTOU: the project dir can vanish after the isdir gate and before

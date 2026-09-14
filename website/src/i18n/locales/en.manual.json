@@ -2989,6 +2989,8 @@
       "webhooks_that_wake_this_crew": "Webhooks that wake this agent"
     },
     "gitPanel": {
+      "not_a_repository": "Not a Git repository",
+      "not_a_repository_help": "This project folder is not a Git working tree. If the repository is in a subfolder, set that folder as the session project.",
       "status_failed": "Couldn’t read the repository status.",
       "log_failed": "Couldn’t read the commit log."
     },

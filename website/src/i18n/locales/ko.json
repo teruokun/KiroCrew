@@ -8057,6 +8057,8 @@
       "empty_state": "표시할 변경 사항이나 커밋이 없습니다.",
       "just_now": "방금 전",
       "loading": "로드 중…",
+      "not_a_repository": "Git 리포지토리가 아님",
+      "not_a_repository_help": "이 프로젝트 폴더는 Git 작업 트리가 아닙니다. 리포지토리가 하위 폴더에 있다면 해당 폴더를 세션 프로젝트로 설정하세요.",
       "no_project": "이 세션에 설정된 프로젝트 폴더가 없습니다.",
       "refresh": "새로 고침",
       "title": "Git",

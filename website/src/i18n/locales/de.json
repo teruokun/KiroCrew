@@ -8171,6 +8171,8 @@
       "empty_state": "Keine Änderungen oder Commits vorhanden.",
       "just_now": "gerade eben",
       "loading": "wird geladen...",
+      "not_a_repository": "Kein Git-Repository",
+      "not_a_repository_help": "Dieser Projektordner ist kein Git-Arbeitsbaum. Wenn sich das Repository in einem Unterordner befindet, lege diesen Ordner als Sitzungsprojekt fest.",
       "no_project": "Kein Projektordner für diese Sitzung festgelegt.",
       "refresh": "Aktualisieren",
       "title": "Git",

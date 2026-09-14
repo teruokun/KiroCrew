@@ -30,6 +30,7 @@ from kiro_crew.dashboard.handlers.files import (
     _match_known_project,
     _match_known_project_for,
     _project_git_branch,
+    _project_git_marker_state,
     _resolve_project_git,
     _slot_project_snapshot,
 )
@@ -252,8 +253,76 @@ class TestProjectGitBranchResolver:
         _git(repo, "worktree", "add", "-q", "-b", "feat/x", str(wt))
         assert (wt / ".git").is_file()
         info = _project_git_branch(os.path.realpath(str(wt)))
+        assert _project_git_marker_state(os.path.realpath(str(wt))) is True
         assert info["repo"] is True
         assert info["branch"] == "feat/x"
+
+    def test_windows_reparse_marker_is_rejected_without_reading_target(self, repo, monkeypatch):
+        marker = os.path.normcase(os.fspath(repo / ".git"))
+        real_lstat = files_mod.os.lstat
+
+        class ReparseDirectory:
+            st_mode = files_mod._stat_mod.S_IFDIR
+            st_file_attributes = 0x400
+
+        def reparse_lstat(path):
+            if os.path.normcase(os.fspath(path)) == marker:
+                return ReparseDirectory()
+            return real_lstat(path)
+
+        read_meta = MagicMock(side_effect=AssertionError("reparse target was read"))
+        monkeypatch.setattr(files_mod.os, "lstat", reparse_lstat)
+        monkeypatch.setattr(files_mod, "_read_git_meta_prefix", read_meta)
+
+        assert _project_git_marker_state(os.path.realpath(str(repo))) is False
+        read_meta.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "gitdir",
+        (
+            r"\\server\share\repo",
+            r"\/server/share/repo",
+            r"/\server/share/repo",
+            r"//server/share/repo",
+            "local\x00repo",
+        ),
+    )
+    def test_unsafe_gitdir_is_rejected_before_target_probe(self, tmp_path, monkeypatch, gitdir):
+        root = tmp_path / "project"
+        root.mkdir()
+        marker = root / ".git"
+        marker.write_text(f"gitdir: {gitdir}\n")
+        marker_path = os.path.normcase(os.fspath(marker))
+        real_path_kind = files_mod._path_kind
+
+        def local_paths_only(path, **kwargs):
+            assert os.path.normcase(os.fspath(path)) == marker_path
+            return real_path_kind(path, **kwargs)
+
+        monkeypatch.setattr(files_mod, "_path_kind", local_paths_only)
+        assert _project_git_marker_state(os.fspath(root)) is False
+
+    def test_linked_gitdir_ancestor_defers_before_target_probe(self, tmp_path, monkeypatch):
+        root = tmp_path / "project"
+        root.mkdir()
+        marker = root / ".git"
+        target = tmp_path / "linked-parent" / "gitdir"
+        marker.write_text(f"gitdir: {target}\n")
+        marker_path = os.path.normcase(os.fspath(marker))
+        real_path_kind = files_mod._path_kind
+
+        def marker_only(path, **kwargs):
+            assert os.path.normcase(os.fspath(path)) == marker_path
+            return real_path_kind(path, **kwargs)
+
+        monkeypatch.setattr(files_mod, "_path_kind", marker_only)
+        monkeypatch.setattr(files_mod, "_WINDOWS_LINKED_ANCESTOR_GUARD", True)
+        monkeypatch.setattr(
+            files_mod.platform_compat,
+            "first_linked_ancestor",
+            lambda _path: os.fspath(tmp_path / "linked-parent"),
+        )
+        assert _project_git_marker_state(os.fspath(root)) is None
 
     def test_detached_head_reports_short_sha(self, repo):
         full = subprocess.run(

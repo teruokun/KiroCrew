@@ -8285,6 +8285,8 @@
       "empty_state": "Nenhuma alteração ou commit para exibir.",
       "just_now": "agora mesmo",
       "loading": "carregando...",
+      "not_a_repository": "Não é um repositório Git",
+      "not_a_repository_help": "Esta pasta do projeto não é uma árvore de trabalho Git. Se o repositório estiver em uma subpasta, defina essa pasta como o projeto da sessão.",
       "no_project": "Nenhuma pasta de projeto definida para esta sessão.",
       "refresh": "Atualizar",
       "title": "Git",

@@ -8285,6 +8285,8 @@
       "empty_state": "Nessuna modifica o commit da mostrare.",
       "just_now": "proprio ora",
       "loading": "caricamento...",
+      "not_a_repository": "Non è un repository Git",
+      "not_a_repository_help": "Questa cartella di progetto non è un albero di lavoro Git. Se il repository si trova in una sottocartella, imposta quella cartella come progetto della sessione.",
       "no_project": "Nessuna cartella di progetto impostata per questa sessione.",
       "refresh": "Aggiorna",
       "title": "Git",

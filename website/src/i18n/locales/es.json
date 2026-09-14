@@ -8285,6 +8285,8 @@
       "empty_state": "No hay cambios ni commits que mostrar.",
       "just_now": "ahora mismo",
       "loading": "cargando...",
+      "not_a_repository": "No es un repositorio Git",
+      "not_a_repository_help": "Esta carpeta de proyecto no es un árbol de trabajo de Git. Si el repositorio está en una subcarpeta, configura esa carpeta como proyecto de la sesión.",
       "no_project": "No hay carpeta de proyecto configurada para esta sesión.",
       "refresh": "Actualizar",
       "title": "Git",

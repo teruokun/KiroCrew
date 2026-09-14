@@ -91,7 +91,10 @@ export default function GitPanel({ projectDir, onFileOpen, onClose }: GitPanelPr
   }, [status?.branch, status?.ahead, refetchLog])
 
   const fileCount = status?.files?.length ?? 0
-  const isClean = fileCount === 0
+  const isRepository = status?.repo === true
+  const noRepository = status?.repo === false
+  const hasNoChanges = fileCount === 0
+  const isClean = isRepository && hasNoChanges
 
   return (
     <DetailPanel
@@ -104,7 +107,9 @@ export default function GitPanel({ projectDir, onFileOpen, onClose }: GitPanelPr
           {/* Branch name */}
           <GitBranch size={14} className="text-accent shrink-0" />
           <span className="text-[12px] font-medium text-text truncate">
-            {status?.branch || i18nT('components.gitPanel.loading')}
+            {status?.branch || (noRepository
+              ? i18nT('components.gitPanel.not_a_repository')
+              : i18nT('components.gitPanel.loading'))}
           </span>
 
           {/* Ahead/behind pill */}
@@ -118,13 +123,15 @@ export default function GitPanel({ projectDir, onFileOpen, onClose }: GitPanelPr
           <span className="flex-1" />
 
           {/* Uncommitted / clean pill */}
-          <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 ${isClean ? 'bg-ok/15 text-ok' : 'bg-warn/15 text-warn'}`}>
-            {statusLoading
-              ? '...'
-              : isClean
-                ? i18nT('components.gitPanel.clean')
-                : i18nT('components.gitPanel.uncommitted', { count: fileCount })}
-          </span>
+          {!noRepository && !statusError && (
+            <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 ${hasNoChanges ? 'bg-ok/15 text-ok' : 'bg-warn/15 text-warn'}`}>
+              {statusLoading
+                ? '...'
+                : hasNoChanges
+                  ? i18nT('components.gitPanel.clean')
+                  : i18nT('components.gitPanel.uncommitted', { count: fileCount })}
+            </span>
+          )}
 
           {/* Refresh */}
           <button
@@ -159,8 +166,15 @@ export default function GitPanel({ projectDir, onFileOpen, onClose }: GitPanelPr
             )}
           </div>
         )}
+
+        {noRepository && (
+          <div role="status" className="px-3 py-8 text-center text-muted text-[12px]">
+            {i18nT('components.gitPanel.not_a_repository_help')}
+          </div>
+        )}
+
         {/* ── CHANGES section ── */}
-        {!isClean && (
+        {isRepository && !hasNoChanges && (
           <section className="py-2">
             <div className="px-3 pb-1.5 flex items-center gap-1.5">
               <span className="text-[10px] font-semibold uppercase tracking-wider text-muted">
